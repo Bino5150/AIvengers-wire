@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+.~lock.*#
+
+# Runtime state and credentials never belong in source control.
+.wire-state/
+*.token
+*.pem
+wire.db
+wire.db-wal
+wire.db-shm
+wire.sock
+seats/
