@@ -14,8 +14,10 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
   permissions.
 - Watch subscriptions require the same seat authentication as every other operation; a first
   frame that is not a well-formed auth request is refused before credentials are considered.
-- Notification events carry the same server-stamped canonical envelope as stored messages; an
-  event frame cannot alter `sender`, `authority`, or `owner`.
+- Notification events carry exactly the canonical envelope `read` returns for the same message
+  (the post-result-only `duplicate` field is stripped); an event frame cannot alter `sender`,
+  `authority`, or `owner`. An idempotent retry (`client_id` reuse) persists nothing new and does
+  not ring the bell a second time.
 - Watch events never advance seat cursors; `read`/`advance` remain the only cursor mutators.
 - A listener that stops draining is disconnected once its pending outbound bytes exceed a fixed
   limit; one slow listener cannot stall the relay or grow memory without bound.

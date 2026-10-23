@@ -7,15 +7,21 @@ socket truth, not in-process mocks.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import socket
+import tempfile
 import time
+import unittest
+from pathlib import Path
 from typing import Any
 
 from aivengers_wire.client import WireClient
 from aivengers_wire.errors import WireError
 from aivengers_wire.protocol import encode_frame
+from aivengers_wire.server import WireServer
 from aivengers_wire.storage import WireStore
 
 from test_wire import RunningWireTestCase
@@ -106,7 +112,7 @@ class WatchNotificationTests(RunningWireTestCase):
         finally:
             sock.close()
 
-    def test_multiple_subscribers_and_simultaneous_posts_in_canonical_order(self) -> None:
+    def test_multiple_subscribers_receive_consecutive_posts_in_canonical_order(self) -> None:
         socks = []
         try:
             for seat in ("rookie", "bino-gateway"):
@@ -377,3 +383,211 @@ class WatchNotificationTests(RunningWireTestCase):
             self.assertIn(pre["id"], [m["id"] for m in history])
         finally:
             sock.close()
+
+    # ── R1 correction regressions (ported from Goblin's independent review
+    # reproductions, AIVENGERS-CROSS-REVIEW-2026-10-23_GOBLIN-WIRE; his
+    # originals remain untouched in the review receipt directory) ──────────
+
+    def test_poster_disconnect_cannot_suppress_persisted_wakeup(self) -> None:
+        """R1/F1: real sockets, unmodified server subprocess, no mocks.
+
+        Ported from adversarial_review.py::test_01_poster_disconnect_cannot_
+        suppress_persisted_wakeup. A poster that aborts its transport right
+        after writing a valid post must not silence the doorbell for the
+        message it just committed.
+        """
+        sock, stream, ack = watch_socket(self.store, "rookie", {"op": "watch"})
+        try:
+            self.assertEqual(ack["watermark"], 0)
+            token = (self.store.seat_dir / "tech.token").read_text(encoding="utf-8").strip()
+            poster = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            poster.settimeout(5.0)
+            poster.connect(str(self.store.socket_path))
+            pstream = poster.makefile("rwb", buffering=0)
+            pstream.write(encode_frame({"op": "auth", "seat": "tech", "token": token}))
+            self.assertTrue(json.loads(pstream.readline())["ok"])
+            pstream.write(
+                encode_frame({"op": "post", "channel": "general", "body": "persist-then-peer-gone"})
+            )
+            # Valid client disconnect immediately after the request frame.
+            poster.close()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and self.store.max_message_id() < 1:
+                time.sleep(0.01)
+            self.assertEqual(self.store.max_message_id(), 1, "post never persisted")
+            second = self.client("bino").request(
+                {"op": "post", "channel": "general", "body": "poster-still-healthy"}
+            )["message"]
+            first = json.loads(stream.readline())
+            second_event = json.loads(stream.readline())
+            self.assertEqual(
+                [first["message"]["id"], second_event["message"]["id"]],
+                [1, second["id"]],
+            )
+            # The watch connection is alive and usable after the gap.
+            stream.write(encode_frame({"op": "ping"}))
+            self.assertTrue(json.loads(stream.readline())["ok"])
+        finally:
+            sock.close()
+
+    def test_notification_envelope_equals_read_envelope_exactly(self) -> None:
+        """R1/F3: full-object equality, not selected fields.
+
+        Ported from adversarial_review.py::test_04_notification_matches_read_
+        envelope_exactly. The event message object must equal the `read`
+        envelope for the same message, key for key.
+        """
+        sock, stream, ack = watch_socket(self.store, "rookie", {"op": "watch"})
+        try:
+            posted = self.client("tech").request(
+                {"op": "post", "channel": "general", "body": "canonical-envelope"}
+            )["message"]
+            event = json.loads(stream.readline())
+            stored = self.client("rookie").request(
+                {"op": "read", "channel": "general", "after": 0, "limit": 10}
+            )["messages"][0]
+            self.assertEqual(event["message"], stored)
+            self.assertNotIn("duplicate", event["message"])
+        finally:
+            sock.close()
+
+    def test_client_id_retry_does_not_ring_the_bell_twice(self) -> None:
+        """R1/F3 behavioral side: a retry persists nothing new and publishes
+        nothing new; the subscriber sees exactly one event for the message."""
+        sock, stream, ack = watch_socket(self.store, "rookie", {"op": "watch"})
+        try:
+            payload = {
+                "op": "post", "channel": "general", "body": "send exactly once",
+                "client_id": "retry-check-1",
+            }
+            first = self.client("tech").request(payload)["message"]
+            first_event = json.loads(stream.readline())
+            self.assertEqual(first_event["message"]["id"], first["id"])
+            retry = self.client("tech").request(payload)["message"]
+            self.assertTrue(retry["duplicate"])
+            self.assertEqual(retry["id"], first["id"])
+            # No second event for the retry.
+            sock.settimeout(0.5)
+            with self.assertRaises(socket.timeout):
+                stream.readline()
+        finally:
+            sock.close()
+
+    def test_public_client_ends_promptly_after_timeout_event(self) -> None:
+        """R1/F2: normal timeout terminates the public iterator cleanly.
+
+        Ported from adversarial_review.py::test_03_public_client_ends_after_
+        timeout_event. Frames must be exactly [subscribed, timeout], no
+        error, and the iterator must finish promptly instead of waiting out
+        the idle timeout.
+        """
+        import threading as _threading
+
+        result: dict[str, object] = {}
+
+        def run() -> None:
+            started = time.monotonic()
+            frames, error = [], None
+            try:
+                for frame in WireClient(self.store, seat="rookie").watch(
+                    timeout_ms=50, idle_timeout_seconds=3.0
+                ):
+                    frames.append(frame)
+            except WireError as exc:
+                error = str(exc)
+            result["frames"] = [f["event"] for f in frames]
+            result["error"] = error
+            result["elapsed"] = time.monotonic() - started
+
+        thread = _threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "watch iterator did not terminate promptly")
+        self.assertEqual(result["frames"], ["subscribed", "timeout"])
+        self.assertIsNone(result["error"])
+        self.assertLess(result["elapsed"], 5.0)
+
+
+class _GatedFlushServer(WireServer):
+    """Controlled scheduling seam for the commit-order regression.
+
+    Parks ONLY the gated writer's post-fanout response drain. Framing,
+    persistence, subscription handling and fanout remain product code.
+    """
+
+    def __init__(self, store: WireStore, harness: "CommitOrderUnderHeldDrain") -> None:
+        super().__init__(store)
+        self._harness = harness
+
+    async def _flush_response(self, writer: Any, committed: dict[str, Any] | None) -> bool:
+        if (
+            committed is not None
+            and committed.get("body") == self._harness.gated_body
+        ):
+            self._harness.entered.set()
+            await self._harness.release.wait()
+        return await super()._flush_response(writer, committed)
+
+
+class CommitOrderUnderHeldDrain(unittest.IsolatedAsyncioTestCase):
+    """R1/F1 ordering: notification order must match commit order even when a
+    poster's response drain is held.
+
+    Ported from adversarial_review.py::test_02_concurrent_posts_preserve_
+    commit_order. Controlled scheduling seam only.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = WireStore(Path(self.temp.name) / "state")
+        self.store.initialize()
+        for seat in ("poster", "second", "listener"):
+            self.store.add_seat(seat)
+        self.gated_body = "gate-first"
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.server = _GatedFlushServer(self.store, self)
+        await self.server.start()
+        self.connections: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
+
+    async def asyncTearDown(self) -> None:
+        self.release.set()
+        for _, writer in self.connections:
+            writer.close()
+        for _, writer in self.connections:
+            with contextlib.suppress(ConnectionError):
+                await writer.wait_closed()
+        await asyncio.sleep(0)
+        await self.server.close()
+        self.temp.cleanup()
+
+    async def connect(self, seat: str):
+        token = (self.store.seat_dir / f"{seat}.token").read_text(encoding="utf-8").strip()
+        reader, writer = await asyncio.open_unix_connection(str(self.store.socket_path))
+        self.connections.append((reader, writer))
+        writer.write(encode_frame({"op": "auth", "seat": seat, "token": token}))
+        ack = json.loads(await asyncio.wait_for(reader.readline(), 2))
+        self.assertTrue(ack["ok"])
+        return reader, writer
+
+    async def test_commit_order_preserved_when_first_poster_drain_is_held(self) -> None:
+        l_reader, l_writer = await self.connect("listener")
+        l_writer.write(encode_frame({"op": "watch"}))
+        ack = json.loads(await asyncio.wait_for(l_reader.readline(), 2))
+        self.assertEqual(ack["event"], "subscribed")
+        p_reader, p_writer = await self.connect("poster")
+        p_writer.write(encode_frame({"op": "post", "channel": "general", "body": "gate-first"}))
+        await asyncio.wait_for(self.entered.wait(), 2)
+        first_ack = json.loads(await asyncio.wait_for(p_reader.readline(), 2))
+        s_reader, s_writer = await self.connect("second")
+        s_writer.write(encode_frame({"op": "post", "channel": "general", "body": "second-overtakes"}))
+        second_ack = json.loads(await asyncio.wait_for(s_reader.readline(), 2))
+        # With publication decoupled from the held drain, the watcher already
+        # received message 1 BEFORE message 2, despite the first poster's
+        # response drain still being parked.
+        e1 = json.loads(await asyncio.wait_for(l_reader.readline(), 2))
+        self.release.set()
+        e2 = json.loads(await asyncio.wait_for(l_reader.readline(), 2))
+        ids = [e1["message"]["id"], e2["message"]["id"]]
+        self.assertEqual(ids, sorted(ids), "newer notification overtook older persisted message")
+        self.assertEqual(ids, [first_ack["message"]["id"], second_ack["message"]["id"]])

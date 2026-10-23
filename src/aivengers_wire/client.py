@@ -73,11 +73,12 @@ class WireClient:
 
         Opens one authenticated connection, sends the ``watch`` op, yields the
         ``subscribed`` ack (carrying the watermark) and then every ``message``
-        / ``timeout`` / ``overflow`` event frame as it arrives, until the
-        server closes the connection (overflow) or the subscription times out.
-        The generator ends cleanly on EOF; ``socket.timeout`` becomes
-        :class:`WireError` so a hung relay surfaces instead of blocking
-        forever.
+        / ``timeout`` / ``overflow`` event frame as it arrives. The generator
+        ends cleanly — without raising — when the subscription completes
+        normally: the server's ``timeout`` event ends the iteration, and an
+        ``overflow`` event followed by the server closing the connection ends
+        it too. Any other server-side close raises :class:`WireError` so a
+        hung or broken relay surfaces instead of blocking forever.
 
         Events never advance cursors. The canonical no-lost-wake-up pattern is
         subscribe-then-read: note the ack's ``watermark``, read from your
@@ -87,10 +88,13 @@ class WireClient:
 
         ``channels`` filters which channels raise events (None = all).
         ``timeout_ms`` asks the server to end the subscription with a
-        ``timeout`` event after that long without... anything to deliver.
-        ``idle_timeout_seconds`` is the client-side socket timeout used while
-        waiting for frames; it defaults to generous headroom over the server
-        timeout so server-side expiry is what you actually observe.
+        ``timeout`` event after that long without anything to deliver; that
+        event terminates this iterator promptly. The server keeps the
+        authenticated connection itself reusable for protocol clients; this
+        iterator simply stops consuming it. ``idle_timeout_seconds`` is the
+        client-side socket timeout used while waiting for frames; it defaults
+        to generous headroom over the server timeout so server-side expiry is
+        what you actually observe.
         """
         if channels is not None:
             if not channels:
@@ -108,6 +112,7 @@ class WireClient:
             idle_timeout_seconds = 30.0 + (timeout_ms / 1000.0 if timeout_ms else 0.0)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(idle_timeout_seconds)
+        terminated = False
         try:
             sock.connect(str(self.store.socket_path))
             with sock.makefile("rwb", buffering=0) as stream:
@@ -123,6 +128,18 @@ class WireClient:
                     if "event" not in frame:
                         raise WireError("wire server sent a non-event frame during watch")
                     yield frame
+                    if frame["event"] == "timeout":
+                        # Normal subscription completion: the server ends the
+                        # subscription (and keeps the connection reusable for
+                        # other clients); this iterator stops consuming it
+                        # and returns instead of waiting on a silent socket.
+                        return
+                    if frame["event"] == "overflow":
+                        # The server drops this listener after announcing the
+                        # overflow, so the next read is EOF by design. Treat
+                        # that documented close as normal termination; any
+                        # other close still raises below.
+                        terminated = True
         except FileNotFoundError as exc:
             raise WireError(
                 f"wire server is not running at {self.store.socket_path}"
@@ -131,5 +148,9 @@ class WireClient:
             raise WireError(
                 f"cannot reach wire server at {self.store.socket_path}: {exc}"
             ) from exc
+        except WireError:
+            if terminated:
+                return
+            raise
         finally:
             sock.close()

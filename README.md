@@ -91,8 +91,10 @@ If `BODY` is omitted, `post` and `reply` read it from standard input.
 
 `wire watch` holds one authenticated connection open and prints an event frame
 per line as messages are persisted — no polling loop, no second transport, no
-new store. Events reuse the exact canonical message envelope that `read`
-returns, so sender attribution and peer provenance survive every hop.
+new store. Events carry exactly the canonical message envelope that `read`
+returns for the same message, so sender attribution and peer provenance
+survive every hop. An idempotent retry (same `client_id`) persists nothing
+new and does not ring the bell twice.
 
 ```text
 $ wire --json watch --seat rookie --channel general --timeout-ms 60000
@@ -111,9 +113,10 @@ The reliable listener pattern is **subscribe, then read**:
 
 Events never advance cursors — `read --advance` remains the only way a seat
 consumes history. A subscription ends on disconnect, on the requested timeout
-(`timeout` event), or when the listener stops draining (an `overflow` event is
-sent best-effort, then the connection is closed; reconnect and catch up from
-your cursor). Without `--channel`, every channel rings the bell.
+(`timeout` event — the CLI then exits promptly with status 0), or when the
+listener stops draining (an `overflow` event is sent best-effort, then the
+connection is closed; reconnect and catch up from your cursor). Without
+`--channel`, every channel rings the bell.
 
 ## Identity and forwarding
 

@@ -158,13 +158,33 @@ class WireServer:
                 if request is None:
                     return
                 response = self._dispatch(request, seat=seat, peer=peer, writer=writer)
-                await self._send(writer, {"ok": True, **response})
-                # Doorbell: fan out only after the message is durably persisted
-                # (dispatch already returned) and after the poster's own
-                # response, so a slow listener can never delay a poster's
-                # round-trip.
-                if isinstance(response.get("message"), dict):
-                    await self._fanout(response["message"])
+                committed = (
+                    response["message"]
+                    if isinstance(response.get("message"), dict)
+                    else None
+                )
+                # Queue the poster's response before any event frame, so a
+                # subscriber that posts on its own watched connection still
+                # reads its response first. Publication of a committed message
+                # is driven by durable persistence, never by the posting
+                # connection's I/O: the response is queued without waiting on
+                # its drain, fanout runs immediately, and only then does the
+                # handler wait on the poster's drain. A disconnecting or
+                # backpressured poster can therefore neither suppress nor
+                # reorder committed-message notifications.
+                try:
+                    writer.write(encode_frame({"ok": True, **response}))
+                except Exception:
+                    pass  # Undeliverable response; the persisted message still publishes.
+                if committed is not None and not committed.get("duplicate"):
+                    # A client_id retry persists nothing new, so it does not
+                    # ring the bell twice. The event carries exactly the
+                    # envelope `read` returns for the same message.
+                    await self._fanout(
+                        {k: v for k, v in committed.items() if k != "duplicate"}
+                    )
+                if not await self._flush_response(writer, committed):
+                    return
         except AuthenticationError as exc:
             await self._safe_error(writer, "authentication_failed", str(exc))
         except ProtocolError as exc:
@@ -187,6 +207,21 @@ class WireServer:
                 await writer.wait_closed()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+    async def _flush_response(self, writer: Any, committed: dict[str, Any] | None) -> bool:
+        """Await the queued response's drain; False when the connection is gone.
+
+        ``committed`` is the persisted message this flush follows (None for
+        non-post operations). Deliberate test seam: the only scheduling point
+        after persistence and fanout, so controlled-scheduling tests can hold
+        a backpressured poster's drain — keyed on the committed message —
+        without touching framing, persistence, subscriptions or fanout.
+        """
+        try:
+            await writer.drain()
+        except (ConnectionError, RuntimeError):
+            return False
+        return True
 
     async def _safe_error(self, writer: asyncio.StreamWriter, code: str, message: str) -> None:
         try:
@@ -362,10 +397,12 @@ class WireServer:
     async def _fanout(self, message: dict[str, Any]) -> None:
         """Deliver one persisted message to every matching live subscriber.
 
-        Write-only on purpose: awaiting each subscriber's drain would let one
-        slow listener stall the posting connection. Boundedness comes from the
-        pre-write buffer check instead — a listener that stops draining is
-        dropped with an ``overflow`` event once its pending bytes pass
+        ``message`` must already be the exact envelope ``read`` returns (the
+        caller strips the post-result-only ``duplicate`` field). Write-only on
+        purpose: awaiting each subscriber's drain would let one slow listener
+        stall the posting connection. Boundedness comes from the pre-write
+        buffer check instead — a listener that stops draining is dropped with
+        an ``overflow`` event once its pending bytes pass
         SUBSCRIBER_BUFFER_LIMIT, and catches up from its durable cursor after
         reconnecting.
         """
