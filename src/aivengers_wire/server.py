@@ -9,6 +9,7 @@ import os
 import socket
 import stat
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +30,34 @@ from .storage import PeerCredentials, Seat, WireStore
 
 LOG = logging.getLogger("aivengers_wire")
 
+#: Watch subscriptions are bounded: a listener whose socket stops draining
+#: gets dropped once its pending outbound bytes pass this limit. The drop is
+#: announced with an ``overflow`` event when possible, then the connection is
+#: closed; the listener reconnects and catches up from its durable cursor.
+SUBSCRIBER_BUFFER_LIMIT = 262_144
+
+#: Upper bound on channels per watch subscription and on the requested
+#: subscription timeout, so one seat cannot pin unbounded server resources.
+MAX_WATCH_CHANNELS = 16
+MAX_WATCH_TIMEOUT_MS = 3_600_000
+
+
+@dataclass
+class _Subscription:
+    """One authenticated listener's watch state."""
+
+    channels: frozenset[str] | None  # None = all channels
+    timer: asyncio.TimerHandle | None = None
+
 
 class WireServer:
     def __init__(self, store: WireStore):
         self.store = store
         self._server: asyncio.AbstractServer | None = None
+        # writer -> subscription. Mutated only from the event loop thread and
+        # never across an await, so registration plus watermark capture is
+        # atomic with respect to message persistence.
+        self._subscribers: dict[Any, _Subscription] = {}
 
     async def start(self) -> None:
         self.store.initialize()
@@ -57,6 +81,9 @@ class WireServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        for writer in list(self._subscribers):
+            self._unsubscribe(writer)
+        self._subscribers.clear()
         try:
             if self.store.socket_path.exists() and stat.S_ISSOCK(
                 self.store.socket_path.lstat().st_mode
@@ -130,8 +157,14 @@ class WireServer:
                 request = await self._read_request(reader)
                 if request is None:
                     return
-                response = self._dispatch(request, seat=seat, peer=peer)
+                response = self._dispatch(request, seat=seat, peer=peer, writer=writer)
                 await self._send(writer, {"ok": True, **response})
+                # Doorbell: fan out only after the message is durably persisted
+                # (dispatch already returned) and after the poster's own
+                # response, so a slow listener can never delay a poster's
+                # round-trip.
+                if isinstance(response.get("message"), dict):
+                    await self._fanout(response["message"])
         except AuthenticationError as exc:
             await self._safe_error(writer, "authentication_failed", str(exc))
         except ProtocolError as exc:
@@ -148,6 +181,7 @@ class WireServer:
             )
             await self._safe_error(writer, "internal_error", "wire operation failed")
         finally:
+            self._unsubscribe(writer)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -171,7 +205,12 @@ class WireServer:
         return self.store.authenticate(seat_name, token)
 
     def _dispatch(
-        self, request: dict[str, Any], *, seat: Seat, peer: PeerCredentials
+        self,
+        request: dict[str, Any],
+        *,
+        seat: Seat,
+        peer: PeerCredentials,
+        writer: Any,
     ) -> dict[str, Any]:
         op = request.get("op")
         if op == "ping":
@@ -247,7 +286,129 @@ class WireServer:
         if op == "channels":
             require_exact_keys(request, required={"op"})
             return {"channels": self.store.list_channels()}
+        if op == "watch":
+            return self._handle_watch(request, seat=seat, writer=writer)
         raise ProtocolError(f"unsupported operation: {op!r}")
+
+    # ── watch: authenticated real-time notification subscription ──────────
+
+    def _handle_watch(
+        self, request: dict[str, Any], *, seat: Seat, writer: Any
+    ) -> dict[str, Any]:
+        """Register this connection as a notification listener.
+
+        Returns the ``subscribed`` ack carrying the watermark synchronously:
+        watermark capture and registry insertion happen in the same event-loop
+        step with no await between them, so every message is either included
+        in the subscriber's pre-subscribe read window (id <= watermark) or
+        guaranteed to raise a later ``message`` event (id > watermark). No
+        wake-up can be lost in between.
+
+        Events never touch seat cursors; ``read``/``advance`` remain the only
+        cursor mutators. A watch is per-connection: closing the socket (or a
+        later ``overflow``/``timeout`` event) ends it.
+        """
+        require_exact_keys(request, required={"op"}, optional={"channels", "timeout_ms"})
+        channels_value = request.get("channels")
+        if channels_value is None:
+            channels: frozenset[str] | None = None
+        else:
+            if not isinstance(channels_value, list) or not channels_value:
+                raise ProtocolError("channels must be a non-empty list when present")
+            if len(channels_value) > MAX_WATCH_CHANNELS:
+                raise ProtocolError(f"channels must not exceed {MAX_WATCH_CHANNELS} entries")
+            channels = frozenset(
+                validate_name(value, field="channel") for value in channels_value
+            )
+        timeout_value = request.get("timeout_ms")
+        timer: asyncio.TimerHandle | None = None
+        if timeout_value is not None:
+            timeout_ms = validate_positive_int(timeout_value, field="timeout_ms")
+            if timeout_ms > MAX_WATCH_TIMEOUT_MS:
+                raise ProtocolError(f"timeout_ms must not exceed {MAX_WATCH_TIMEOUT_MS}")
+            loop = asyncio.get_running_loop()
+            timer = loop.call_later(
+                timeout_ms / 1000.0, self._on_watch_timeout, writer
+            )
+        watermark = self.store.max_message_id()
+        previous = self._subscribers.get(writer)
+        if previous is not None and previous.timer is not None:
+            previous.timer.cancel()
+        self._subscribers[writer] = _Subscription(channels=channels, timer=timer)
+        LOG.info(
+            "watch subscribed seat=%r channels=%r watermark=%d",
+            seat.name,
+            sorted(channels) if channels is not None else "*",
+            watermark,
+        )
+        return {"event": "subscribed", "watermark": watermark}
+
+    def _unsubscribe(self, writer: Any) -> None:
+        subscription = self._subscribers.pop(writer, None)
+        if subscription is not None and subscription.timer is not None:
+            subscription.timer.cancel()
+
+    def _on_watch_timeout(self, writer: Any) -> None:
+        subscription = self._subscribers.get(writer)
+        if subscription is None:
+            return
+        self._unsubscribe(writer)
+        try:
+            writer.write(encode_frame({"ok": True, "event": "timeout"}))
+        except Exception:  # pragma: no cover - transport already gone
+            pass
+        LOG.info("watch timeout delivered")
+
+    async def _fanout(self, message: dict[str, Any]) -> None:
+        """Deliver one persisted message to every matching live subscriber.
+
+        Write-only on purpose: awaiting each subscriber's drain would let one
+        slow listener stall the posting connection. Boundedness comes from the
+        pre-write buffer check instead — a listener that stops draining is
+        dropped with an ``overflow`` event once its pending bytes pass
+        SUBSCRIBER_BUFFER_LIMIT, and catches up from its durable cursor after
+        reconnecting.
+        """
+        if not self._subscribers:
+            return
+        channel = message["channel"]
+        frame = encode_frame({"ok": True, "event": "message", "message": message})
+        for writer, subscription in list(self._subscribers.items()):
+            if (
+                subscription.channels is not None
+                and channel not in subscription.channels
+            ):
+                continue
+            transport = writer.transport
+            buffered = 0 if transport is None else transport.get_write_buffer_size()
+            if buffered + len(frame) > SUBSCRIBER_BUFFER_LIMIT:
+                await self._drop_subscriber(writer, message["id"], reason="overflow")
+                continue
+            try:
+                writer.write(frame)
+            except Exception:
+                await self._drop_subscriber(writer, message["id"], reason="unwritable")
+
+    async def _drop_subscriber(self, writer: Any, last_id: int, *, reason: str) -> None:
+        self._unsubscribe(writer)
+        try:
+            writer.write(
+                encode_frame(
+                    {
+                        "ok": True,
+                        "event": "overflow",
+                        "reason": reason,
+                        "last_persisted_id": last_id,
+                    }
+                )
+            )
+        except Exception:
+            pass
+        try:
+            writer.close()
+        except Exception:  # pragma: no cover - transport already gone
+            pass
+        LOG.info("watch subscriber dropped reason=%s last_persisted_id=%d", reason, last_id)
 
 
 async def run_server(store: WireStore) -> None:

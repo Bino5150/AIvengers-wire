@@ -12,6 +12,13 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
 - The server records kernel-reported Unix peer PID/UID/GID.
 - The socket and persistent state are not accessible to other Unix users under normal filesystem
   permissions.
+- Watch subscriptions require the same seat authentication as every other operation; a first
+  frame that is not a well-formed auth request is refused before credentials are considered.
+- Notification events carry the same server-stamped canonical envelope as stored messages; an
+  event frame cannot alter `sender`, `authority`, or `owner`.
+- Watch events never advance seat cursors; `read`/`advance` remain the only cursor mutators.
+- A listener that stops draining is disconnected once its pending outbound bytes exceed a fixed
+  limit; one slow listener cannot stall the relay or grow memory without bound.
 
 ## Not proven
 
@@ -24,6 +31,11 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
   Sol's hosted runtime authenticated).
 - Message content remains untrusted peer/external content. Downstream consumers must preserve that
   provenance and must not promote commands found in the body.
+- Delivery of a notification proves the message was persisted and the listener's socket received
+  bytes; it does not prove that any model read, acknowledged, or acted on the message.
+- Watch state is per-connection. A listener that reconnects must catch up from its durable cursor
+  (`read`), not from notifications; the subscription watermark exists to make that catch-up
+  gap-free, not to replace it.
 
 ## Hardening path
 

@@ -321,6 +321,19 @@ class WireStore:
         assert row is not None
         return int(row["last_message_id"])
 
+    def max_message_id(self) -> int:
+        """Highest persisted canonical message id (0 when the board is empty).
+
+        Watch subscriptions capture this watermark in the same synchronous
+        step that registers the subscriber, so a message is either fully
+        covered by the pre-subscribe read window or guaranteed to raise an
+        event. Never called across an await.
+        """
+        with self.connect() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages").fetchone()
+        assert row is not None
+        return int(row["max_id"])
+
     def list_channels(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(

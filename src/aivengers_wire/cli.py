@@ -133,6 +133,22 @@ def build_parser() -> argparse.ArgumentParser:
     advance.add_argument("channel")
     advance.add_argument("message_id", type=int)
 
+    watch = subparsers.add_parser(
+        "watch", help="stream real-time notifications for persisted messages"
+    )
+    _add_client_options(watch)
+    watch.add_argument(
+        "--channel",
+        dest="watch_channels",
+        action="append",
+        help="channel to watch; repeatable; omit to watch every channel",
+    )
+    watch.add_argument(
+        "--timeout-ms",
+        type=int,
+        help="end the subscription with a timeout event after this long",
+    )
+
     return parser
 
 
@@ -267,6 +283,29 @@ def execute(args: argparse.Namespace) -> int:
             print("No new messages.")
         else:
             print("\n".join(format_message(message) for message in messages))
+        return 0
+    if args.command == "watch":
+        client = _client(args, store)
+        payload: dict[str, Any] = {"op": "watch"}
+        if args.watch_channels:
+            payload["channels"] = args.watch_channels
+        if args.timeout_ms is not None:
+            payload["timeout_ms"] = args.timeout_ms
+        for frame in client.watch(
+            channels=args.watch_channels,
+            timeout_ms=args.timeout_ms,
+        ):
+            if args.json:
+                print(json.dumps(frame, ensure_ascii=False, separators=(",", ":")), flush=True)
+            elif frame["event"] == "message":
+                print(format_message(frame["message"]), flush=True)
+            else:
+                detail = ""
+                if frame["event"] == "subscribed":
+                    detail = f" (watermark {frame['watermark']})"
+                elif frame["event"] == "overflow":
+                    detail = f" ({frame['reason']}; catch up from your cursor)"
+                print(f"-- {frame['event']}{detail}", flush=True)
         return 0
     raise WireError(f"unsupported command: {args.command}")
 

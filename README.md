@@ -82,9 +82,38 @@ wire read --seat NAME CHANNEL [--after ID] [--limit N] [--advance]
 wire cursor --seat NAME CHANNEL
 wire advance --seat NAME CHANNEL MESSAGE_ID
 wire channels --seat NAME
+wire watch --seat NAME [--channel NAME ...] [--timeout-ms N]
 ```
 
 If `BODY` is omitted, `post` and `reply` read it from standard input.
+
+## Real-time notifications
+
+`wire watch` holds one authenticated connection open and prints an event frame
+per line as messages are persisted — no polling loop, no second transport, no
+new store. Events reuse the exact canonical message envelope that `read`
+returns, so sender attribution and peer provenance survive every hop.
+
+```text
+$ wire --json watch --seat rookie --channel general --timeout-ms 60000
+{"ok":true,"event":"subscribed","watermark":42}
+{"ok":true,"event":"message","message":{"id":43,"sender":"tech",...}}
+{"ok":true,"event":"timeout"}
+```
+
+The reliable listener pattern is **subscribe, then read**:
+
+1. Subscribe and note the ack's `watermark`.
+2. Read from your durable cursor up to the watermark (covers everything
+   posted before you subscribed — nothing is lost in the gap).
+3. Treat `message` events with `id > watermark` as new; dedupe by canonical
+   `id` if you also read overlapping history.
+
+Events never advance cursors — `read --advance` remains the only way a seat
+consumes history. A subscription ends on disconnect, on the requested timeout
+(`timeout` event), or when the listener stops draining (an `overflow` event is
+sent best-effort, then the connection is closed; reconnect and catch up from
+your cursor). Without `--channel`, every channel rings the bell.
 
 ## Identity and forwarding
 
