@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import socket
+import struct
 import tempfile
 import time
 import unittest
@@ -388,29 +389,78 @@ class WatchNotificationTests(RunningWireTestCase):
     # reproductions, AIVENGERS-CROSS-REVIEW-2026-10-23_GOBLIN-WIRE; his
     # originals remain untouched in the review receipt directory) ──────────
 
+    def _server_socket_fds(self) -> int:
+        """Count socket fds held by the relay subprocess (test-only seam)."""
+        count = 0
+        for entry in Path(f"/proc/{self.server.pid}/fd").iterdir():
+            try:
+                target = os.readlink(entry)
+            except OSError:
+                continue  # fd vanished mid-scan; not one we are counting
+            if target.startswith("socket:["):
+                count += 1
+        return count
+
+    def _wait_server_socket_fds(self, expected: int, description: str) -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if self._server_socket_fds() == expected:
+                return
+            time.sleep(0.01)
+        self.fail(f"{description}: relay socket-fd count never reached {expected}")
+
     def test_poster_disconnect_cannot_suppress_persisted_wakeup(self) -> None:
-        """R1/F1: real sockets, unmodified server subprocess, no mocks.
+        """R1/F1 regression, R2-hardened: the poster genuinely disconnects.
 
         Ported from adversarial_review.py::test_01_poster_disconnect_cannot_
-        suppress_persisted_wakeup. A poster that aborts its transport right
-        after writing a valid post must not silence the doorbell for the
-        message it just committed.
+        suppress_persisted_wakeup. A poster that disconnects right after
+        writing a valid post must not silence the doorbell for the message
+        it just committed.
+
+        R2: Goblin's re-review proved the R1 port left the poster's
+        makefile() object open, so poster.close() never released the
+        underlying connection (CPython keeps the socket open while makefile
+        objects exist) and this regression passed against the known-broken
+        parent aef2d97. The poster now closes its makefile and hard-closes
+        the socket with SO_LINGER(1,0) — the raw-socket equivalent of the
+        transport.abort() in the original probe — and the test verifies the
+        disconnect actually happened server-side (the relay's accepted fd
+        for the poster connection is released) before asserting that the
+        committed message still rang the bell.
         """
         sock, stream, ack = watch_socket(self.store, "rookie", {"op": "watch"})
         try:
             self.assertEqual(ack["watermark"], 0)
             token = (self.store.seat_dir / "tech.token").read_text(encoding="utf-8").strip()
+            baseline = self._server_socket_fds()
             poster = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             poster.settimeout(5.0)
             poster.connect(str(self.store.socket_path))
+            self._wait_server_socket_fds(
+                baseline + 1, "server accepted poster connection"
+            )
             pstream = poster.makefile("rwb", buffering=0)
             pstream.write(encode_frame({"op": "auth", "seat": "tech", "token": token}))
             self.assertTrue(json.loads(pstream.readline())["ok"])
             pstream.write(
                 encode_frame({"op": "post", "channel": "general", "body": "persist-then-peer-gone"})
             )
-            # Valid client disconnect immediately after the request frame.
+            # Genuine client disconnect immediately after the request frame:
+            # release the makefile first (socket.close() alone cannot close a
+            # socket with an open makefile object), then hard-close with
+            # SO_LINGER(1,0) so the relay observes a real disconnect instead
+            # of a lingering half-open fd.
+            pstream.close()
+            poster.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+            )
             poster.close()
+            # Verify the disconnect actually occurred: the relay's accepted
+            # fd for the poster connection is released once its handler
+            # observes the reset and runs its cleanup path.
+            self._wait_server_socket_fds(
+                baseline, "server released poster connection"
+            )
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and self.store.max_message_id() < 1:
                 time.sleep(0.01)
@@ -418,11 +468,35 @@ class WatchNotificationTests(RunningWireTestCase):
             second = self.client("bino").request(
                 {"op": "post", "channel": "general", "body": "poster-still-healthy"}
             )["message"]
-            first = json.loads(stream.readline())
-            second_event = json.loads(stream.readline())
+            # Collect the next two message events with a bounded raw-recv
+            # poll (makefile streams are poisoned by mid-read timeouts; see
+            # recv_line). On the broken parent the committed message's event
+            # never arrives, so this assertion — not a bare socket timeout —
+            # is what fails, naming the defect.
+            events: list[dict[str, Any]] = []
+            deadline = time.monotonic() + 5
+            while len(events) < 2 and time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                try:
+                    chunk = recv_line(sock, min(2.0, max(0.1, remaining)))
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                # One recv can deliver multiple newline-framed events at once.
+                for part in chunk.split(b"\n"):
+                    if not part:
+                        continue
+                    frame = json.loads(part)
+                    if frame.get("event") == "message":
+                        events.append(frame["message"])
+                    if len(events) >= 2:
+                        break
             self.assertEqual(
-                [first["message"]["id"], second_event["message"]["id"]],
+                [message["id"] for message in events],
                 [1, second["id"]],
+                "committed message's wakeup was lost when the poster "
+                "disconnected; healthy watcher must still be rung",
             )
             # The watch connection is alive and usable after the gap.
             stream.write(encode_frame({"op": "ping"}))
