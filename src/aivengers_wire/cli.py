@@ -148,6 +148,58 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="end the subscription with a timeout event after this long",
     )
+    watch.add_argument(
+        "--session",
+        dest="watch_session",
+        help="bind this watch to one of this seat's registered sessions "
+        "(required to receive session-targeted wakes)",
+    )
+
+    sessions_cmd = subparsers.add_parser(
+        "sessions", help="list this seat's registered wake sessions"
+    )
+    _add_client_options(sessions_cmd)
+
+    wake = subparsers.add_parser(
+        "wake", help="request a durable wake intent for a target seat and task"
+    )
+    _add_client_options(wake)
+    wake.add_argument("--target-seat", required=True)
+    wake.add_argument("--task", dest="task_ref", required=True)
+    wake.add_argument("--session", dest="target_session_id")
+    wake.add_argument("--idempotency-key")
+    wake.add_argument("--priority", type=int)
+    wake.add_argument("--ttl-seconds", type=int)
+    wake.add_argument("--note")
+
+    wake_status = subparsers.add_parser(
+        "wake-status", help="show one wake's exact pipeline position"
+    )
+    _add_client_options(wake_status)
+    wake_status.add_argument("wake_id")
+
+    wake_list = subparsers.add_parser(
+        "wake-list", help="list wakes addressed to or requested by this seat"
+    )
+    _add_client_options(wake_list)
+    wake_list.add_argument("--state")
+
+    task = subparsers.add_parser(
+        "task", help="manage owner-granted tasks (local operator only)"
+    )
+    task_sub = task.add_subparsers(dest="task_command", required=True)
+    task_add = task_sub.add_parser(
+        "add", help="create a task grant locally; never creatable over the socket"
+    )
+    task_add.add_argument("task_id")
+    task_add.add_argument("--title", required=True)
+    task_add.add_argument("--scope", help="JSON object describing the authorized scope")
+    task_list = task_sub.add_parser("list", help="list task grants")
+    task_cancel = task_sub.add_parser(
+        "cancel", help="cancel a task; pending wakes are defeated at claim time"
+    )
+    task_cancel.add_argument("task_id")
+    task_cancel.add_argument("--reason")
 
     return parser
 
@@ -291,14 +343,26 @@ def execute(args: argparse.Namespace) -> int:
             payload["channels"] = args.watch_channels
         if args.timeout_ms is not None:
             payload["timeout_ms"] = args.timeout_ms
+        if args.watch_session is not None:
+            payload["session_id"] = args.watch_session
         for frame in client.watch(
             channels=args.watch_channels,
             timeout_ms=args.timeout_ms,
+            session_id=args.watch_session,
         ):
             if args.json:
                 print(json.dumps(frame, ensure_ascii=False, separators=(",", ":")), flush=True)
             elif frame["event"] == "message":
                 print(format_message(frame["message"]), flush=True)
+            elif frame["event"] == "wake":
+                wake = frame["wake"]
+                target = wake.get("target_session_id") or wake["target_seat"]
+                print(
+                    f"[wake {wake['wake_id'][:12]}] task={wake['task_ref']} "
+                    f"target={target} from={wake['requested_by']} "
+                    f"state={wake['state']} attempts={wake['attempts']}",
+                    flush=True,
+                )
             else:
                 detail = ""
                 if frame["event"] == "subscribed":
@@ -306,6 +370,74 @@ def execute(args: argparse.Namespace) -> int:
                 elif frame["event"] == "overflow":
                     detail = f" ({frame['reason']}; catch up from your cursor)"
                 print(f"-- {frame['event']}{detail}", flush=True)
+        return 0
+    if args.command == "sessions":
+        response = client.request({"op": "sessions"})
+        _emit(response if args.json else response["sessions"], as_json=args.json)
+        return 0
+    if args.command == "wake":
+        payload = {
+            "op": "wake",
+            "target_seat": args.target_seat,
+            "task_ref": args.task_ref,
+        }
+        if args.target_session_id is not None:
+            payload["target_session_id"] = args.target_session_id
+        if args.idempotency_key is not None:
+            payload["idempotency_key"] = args.idempotency_key
+        if args.priority is not None:
+            payload["priority"] = args.priority
+        if args.ttl_seconds is not None:
+            payload["ttl_seconds"] = args.ttl_seconds
+        if args.note is not None:
+            payload["note"] = args.note
+        response = client.request(payload)
+        if args.json:
+            _emit(response, as_json=True)
+        else:
+            print(
+                f"wake {response['wake']['wake_id'][:12]} "
+                f"resolution={response['resolution']} "
+                f"state={response['wake']['state']}"
+            )
+            if response["candidates"]:
+                print("candidates: " + ", ".join(response["candidates"]))
+        return 0
+    if args.command == "wake-status":
+        response = client.request({"op": "wake_status", "wake_id": args.wake_id})
+        _emit(response if args.json else response["wake"], as_json=args.json)
+        return 0
+    if args.command == "wake-list":
+        payload = {"op": "wake_list"}
+        if args.state is not None:
+            payload["state"] = args.state
+        response = client.request(payload)
+        _emit(response if args.json else response["wakes"], as_json=args.json)
+        return 0
+    if args.command == "task" and args.task_command == "add":
+        store.initialize()
+        scope = None
+        if args.scope is not None:
+            scope = json.loads(args.scope)
+            if not isinstance(scope, dict):
+                raise WireError("--scope must be a JSON object")
+        task = store.add_task(
+            task_id=args.task_id, title=args.title, scope=scope
+        )
+        _emit(
+            {"task": task, "note": "created locally; peers cannot create tasks"},
+            as_json=args.json,
+        )
+        return 0
+    if args.command == "task" and args.task_command == "list":
+        store.initialize()
+        tasks = store.list_tasks()
+        _emit({"tasks": tasks} if args.json else tasks, as_json=args.json)
+        return 0
+    if args.command == "task" and args.task_command == "cancel":
+        store.initialize()
+        task = store.cancel_task(task_id=args.task_id, reason=args.reason)
+        _emit({"task": task} if args.json else task, as_json=args.json)
         return 0
     raise WireError(f"unsupported command: {args.command}")
 

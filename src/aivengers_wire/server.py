@@ -44,10 +44,18 @@ MAX_WATCH_TIMEOUT_MS = 3_600_000
 
 @dataclass
 class _Subscription:
-    """One authenticated listener's watch state."""
+    """One authenticated listener's watch state.
+
+    W0 wake note: ``seat`` records which seat the subscription belongs to
+    (wake fanout is seat-scoped) and ``session_id`` optionally binds the
+    watch to one registered session, so a session-targeted wake is delivered
+    to that session's own watcher rather than sprayed across the seat.
+    """
 
     channels: frozenset[str] | None  # None = all channels
     timer: asyncio.TimerHandle | None = None
+    seat: str = ""
+    session_id: str | None = None
 
 
 class WireServer:
@@ -185,6 +193,11 @@ class WireServer:
                     )
                 if not await self._flush_response(writer, committed):
                     return
+                if request.get("op") == "watch":
+                    # W0 wake: after the subscribed ack is on the wire, hand
+                    # this watcher any wake intents that were queued for its
+                    # seat (or its bound session) while nothing was listening.
+                    await self._deliver_pending_wakes(seat, writer)
         except AuthenticationError as exc:
             await self._safe_error(writer, "authentication_failed", str(exc))
         except ProtocolError as exc:
@@ -323,6 +336,114 @@ class WireServer:
             return {"channels": self.store.list_channels()}
         if op == "watch":
             return self._handle_watch(request, seat=seat, writer=writer)
+        if op == "register":
+            require_exact_keys(
+                request,
+                required={"op", "adapter"},
+                optional={
+                    "capabilities",
+                    "model_claim",
+                    "lease_seconds",
+                    "platform_pid",
+                    "meta",
+                },
+            )
+            session = self.store.register_session(
+                seat=seat,
+                adapter=request["adapter"],
+                capabilities=request.get("capabilities"),
+                model_claim=request.get("model_claim"),
+                lease_seconds=request.get("lease_seconds"),
+                platform_pid=request.get("platform_pid"),
+                meta=request.get("meta"),
+            )
+            return {"session": session}
+        if op == "heartbeat":
+            require_exact_keys(
+                request, required={"op", "session_id"}, optional={"state"}
+            )
+            session = self.store.heartbeat_session(
+                seat=seat, session_id=request["session_id"], state=request.get("state")
+            )
+            return {"session": session}
+        if op == "unregister":
+            require_exact_keys(request, required={"op", "session_id"})
+            session = self.store.unregister_session(
+                seat=seat, session_id=request["session_id"]
+            )
+            return {"session": session}
+        if op == "sessions":
+            require_exact_keys(request, required={"op"})
+            return {"sessions": self.store.list_sessions(seat=seat.name)}
+        if op == "wake":
+            require_exact_keys(
+                request,
+                required={"op", "target_seat", "task_ref"},
+                optional={
+                    "target_session_id",
+                    "idempotency_key",
+                    "priority",
+                    "ttl_seconds",
+                    "note",
+                },
+            )
+            wake, resolution, candidates = self.store.request_wake(
+                requester=seat,
+                target_seat=request["target_seat"],
+                task_ref=request["task_ref"],
+                target_session_id=request.get("target_session_id"),
+                idempotency_key=request.get("idempotency_key"),
+                priority=request.get("priority", 5),
+                ttl_seconds=request.get("ttl_seconds"),
+                note=request.get("note"),
+            )
+            if resolution == "deliverable":
+                # Mark delivered first so the event frame carries the truthful
+                # post-transition record (state=delivered, attempts counted).
+                # If no bound watcher is actually live anymore (disconnect
+                # race), revert the mark and report ``queued`` honestly.
+                wake = self.store.mark_wake_delivered(wake["wake_id"])
+                if self._fanout_wake(wake):
+                    resolution = "delivered"
+                else:
+                    wake = self.store.revert_wake_delivery(wake["wake_id"])
+                    resolution = "queued"
+            return {"wake": wake, "resolution": resolution, "candidates": candidates}
+        if op == "wake_ack":
+            require_exact_keys(request, required={"op", "wake_id", "session_id"})
+            wake = self.store.acknowledge_wake(
+                seat=seat, wake_id=request["wake_id"], session_id=request["session_id"]
+            )
+            return {"wake": wake}
+        if op == "claim":
+            require_exact_keys(request, required={"op", "wake_id", "session_id"})
+            return self.store.claim_wake(
+                seat=seat, wake_id=request["wake_id"], session_id=request["session_id"]
+            )
+        if op == "complete":
+            require_exact_keys(
+                request,
+                required={"op", "task_ref", "session_id", "outcome"},
+                optional={"note"},
+            )
+            return self.store.complete_task(
+                seat=seat,
+                task_ref=request["task_ref"],
+                session_id=request["session_id"],
+                outcome=request["outcome"],
+                note=request.get("note"),
+            )
+        if op == "wake_status":
+            require_exact_keys(request, required={"op", "wake_id"})
+            wake = self.store.get_wake(request["wake_id"])
+            if wake is None:
+                raise WireError("unknown wake")
+            if seat.name not in (wake["target_seat"], wake["requested_by"]):
+                raise WireError("wake is not addressed to this seat")
+            return {"wake": wake}
+        if op == "wake_list":
+            require_exact_keys(request, required={"op"}, optional={"state"})
+            return {"wakes": self.store.list_wakes(seat=seat.name, state=request.get("state"))}
         raise ProtocolError(f"unsupported operation: {op!r}")
 
     # ── watch: authenticated real-time notification subscription ──────────
@@ -343,7 +464,20 @@ class WireServer:
         cursor mutators. A watch is per-connection: closing the socket (or a
         later ``overflow``/``timeout`` event) ends it.
         """
-        require_exact_keys(request, required={"op"}, optional={"channels", "timeout_ms"})
+        require_exact_keys(
+            request, required={"op"}, optional={"channels", "timeout_ms", "session_id"}
+        )
+        session_id: str | None = None
+        session_id_value = request.get("session_id")
+        if session_id_value is not None:
+            if not isinstance(session_id_value, str) or not session_id_value:
+                raise ProtocolError("session_id must be a non-empty string when present")
+            session = self.store.get_session(session_id_value)
+            if session is None:
+                raise WireError("unknown session")
+            if session["seat"] != seat.name:
+                raise WireError("session belongs to a different seat")
+            session_id = session_id_value
         channels_value = request.get("channels")
         if channels_value is None:
             channels: frozenset[str] | None = None
@@ -369,7 +503,9 @@ class WireServer:
         previous = self._subscribers.get(writer)
         if previous is not None and previous.timer is not None:
             previous.timer.cancel()
-        self._subscribers[writer] = _Subscription(channels=channels, timer=timer)
+        self._subscribers[writer] = _Subscription(
+            channels=channels, timer=timer, seat=seat.name, session_id=session_id
+        )
         LOG.info(
             "watch subscribed seat=%r channels=%r watermark=%d",
             seat.name,
@@ -446,6 +582,103 @@ class WireServer:
         except Exception:  # pragma: no cover - transport already gone
             pass
         LOG.info("watch subscriber dropped reason=%s last_persisted_id=%d", reason, last_id)
+
+    # ── wake: durable targeted wake intents (W0) ─────────────────────────
+
+    def _drop_subscriber_now(self, writer: Any, last_ref: str, *, reason: str) -> None:
+        """Synchronous containment drop used by the wake fanout paths.
+
+        Mirrors :meth:`_drop_subscriber` (which is async only by signature —
+        it contains no awaits) so the wake dispatch, which runs inside the
+        synchronous ``_dispatch`` call, can contain a stalled listener without
+        restructuring the existing message fanout.
+        """
+
+        self._unsubscribe(writer)
+        try:
+            writer.write(
+                encode_frame(
+                    {
+                        "ok": True,
+                        "event": "overflow",
+                        "reason": reason,
+                        "last_persisted_id": last_ref,
+                    }
+                )
+            )
+        except Exception:
+            pass
+        try:
+            writer.close()
+        except Exception:  # pragma: no cover - transport already gone
+            pass
+        LOG.info("wake subscriber dropped reason=%s last_ref=%s", reason, last_ref)
+
+    def _fanout_wake(self, wake: dict[str, Any]) -> int:
+        """Deliver one wake event to the target's bound watcher, if live.
+
+        A session-targeted wake goes only to the watch connection bound to
+        that ``session_id``. A seat-level wake goes only to unbound watchers
+        of the seat. Returns the number of sockets the frame was written to;
+        the caller turns that into ``delivered`` vs ``queued`` honestly.
+        Write-only, bounded by the same buffer rule as message fanout.
+        """
+
+        if not self._subscribers:
+            return 0
+        frame = encode_frame({"ok": True, "event": "wake", "wake": wake})
+        target_session = wake.get("target_session_id")
+        delivered = 0
+        for writer, subscription in list(self._subscribers.items()):
+            if subscription.seat != wake["target_seat"]:
+                continue
+            if target_session is not None and subscription.session_id != target_session:
+                continue
+            if target_session is None and subscription.session_id is not None:
+                continue
+            transport = writer.transport
+            buffered = 0 if transport is None else transport.get_write_buffer_size()
+            if buffered + len(frame) > SUBSCRIBER_BUFFER_LIMIT:
+                self._drop_subscriber_now(writer, wake["wake_id"], reason="overflow")
+                continue
+            try:
+                writer.write(frame)
+            except Exception:
+                self._drop_subscriber_now(writer, wake["wake_id"], reason="unwritable")
+                continue
+            delivered += 1
+        return delivered
+
+    async def _deliver_pending_wakes(self, seat: Seat, writer: Any) -> None:
+        """Hand a freshly subscribed watcher its seat's queued wake intents.
+
+        Runs immediately after the ``subscribed`` ack is flushed, so the
+        client observes ack first, then catch-up wake events, then live
+        traffic — the same subscribe-then-catch-up shape as message history.
+        """
+
+        subscription = self._subscribers.get(writer)
+        if subscription is None:
+            return
+        wakes = self.store.pending_wakes_for_watch(
+            seat=seat.name, session_id=subscription.session_id
+        )
+        for wake in wakes:
+            frame = encode_frame({"ok": True, "event": "wake", "wake": wake})
+            transport = writer.transport
+            buffered = 0 if transport is None else transport.get_write_buffer_size()
+            if buffered + len(frame) > SUBSCRIBER_BUFFER_LIMIT:
+                self._drop_subscriber_now(writer, wake["wake_id"], reason="overflow")
+                return
+            try:
+                writer.write(frame)
+            except Exception:
+                self._drop_subscriber_now(writer, wake["wake_id"], reason="unwritable")
+                return
+        if wakes:
+            LOG.info(
+                "pending wakes delivered seat=%r count=%d", seat.name, len(wakes)
+            )
 
 
 async def run_server(store: WireStore) -> None:
