@@ -16,17 +16,26 @@ smallest durable foundation for agent wake:
   resume. The state machine records exactly what happened and nothing more.
 
 State-machine honesty contract (mirrors SECURITY.md and the Chapter 06
-baseline "notification is not cognitive activation"):
+baseline "notification is not cognitive activation"), REVISED per owner
+dispatch after the Goblin R2 review:
 
-    pending -> delivered -> acknowledged -> claimed -> completed | failed
-    pending/delivered/acknowledged -> expired | cancelled | ambiguous
+    pending -> delivered -> claimed -> completed | failed
+    pending/delivered -> expired | cancelled | ambiguous
 
-``delivered`` means a watcher socket of the target seat received the wake
-event frame. It does NOT mean any model read it, resumed, or acted.
-``acknowledged`` means an authenticated adapter said it holds the intent.
-``claimed`` means one session atomically won the task. Every other outcome
-is recorded as exactly what it is: expired, cancelled, ambiguous, failed.
-Unknown stays unknown; offline stays offline; unsupported stays unsupported.
+``pending`` means the durable intent exists and NO adapter has receipted it.
+A successful socket frame write is a TRANSMISSION ATTEMPT (attempts counter)
+and never a state transition: a frame handed to a socket buffer does not
+prove any receiver read it, so it must not durably mark delivery. Unacked
+wakes stay pending and are replayed on every eligible watch subscription;
+redelivery is safe because task claims are exactly-once.
+``delivered`` means an authenticated, live, capable session of the target
+seat acknowledged the intent (``wake_ack``). It is an adapter receipt —
+NOT a model resume and NOT task progress. There is deliberately no
+``resumed`` state: only platform evidence could mint that, and no platform
+offers it yet. ``claimed`` means one session atomically won the task.
+Every other outcome is recorded as exactly what it is: expired, cancelled,
+ambiguous, failed. Unknown stays unknown; offline stays offline;
+unsupported stays unsupported.
 
 Schema policy: the three tables are added with ``CREATE TABLE IF NOT EXISTS``
 and ``SCHEMA_VERSION`` is deliberately left at 1 for W0. Old relay code
@@ -60,6 +69,16 @@ MAX_LEASE_SECONDS = 86_400
 #: marked expired (lazily, on access) instead of lurking forever.
 MAX_WAKE_TTL_SECONDS = 86_400
 
+#: R8: wake_list pagination bound. Worst-case serialized wake rows observed
+#: during review were ~410 bytes; 100 rows ≈ 41 KB, safely under the 65,536-
+#: byte transport frame limit including envelope overhead.
+MAX_WAKE_LIST_LIMIT = 100
+
+#: R2: maximum pending wakes offered to one watch subscription per catch-up
+#: cycle. Anything beyond stays pending for the next cycle; replay is safe
+#: because claims are exactly-once and ack is the durable receipt.
+PENDING_REPLAY_BATCH = 32
+
 #: Advisory metadata only. Never an identity, never an authority input.
 MAX_MODEL_CLAIM_CHARS = 128
 MAX_TASK_REF_CHARS = 128
@@ -71,11 +90,13 @@ MAX_META_CHARS = 2_048
 SESSION_STATES = ("ready", "busy", "draining", "offline", "expired", "revoked")
 LIVE_SESSION_STATES = ("ready", "busy")
 
-#: Wake pipeline states, in honest order.
+#: Wake pipeline states, in honest order. R2 revision: ``delivered`` is the
+#: adapter-receipt state (set only by ``wake_ack``); the former separate
+#: ``acknowledged`` state was redundant with it and is retired. Frame writes
+#: are attempts, never transitions.
 WAKE_STATES = (
     "pending",
     "delivered",
-    "acknowledged",
     "claimed",
     "completed",
     "failed",
@@ -83,6 +104,11 @@ WAKE_STATES = (
     "cancelled",
     "ambiguous",
 )
+
+#: States from which a claim may proceed. Claiming directly from ``pending``
+#: is the poll catch-up path (the adapter learned of the wake via wake_list);
+#: the transition to ``claimed`` itself records receipt of the intent.
+CLAIMABLE_WAKE_STATES = ("pending", "delivered")
 
 #: Task states. Only the operator (local CLI) or a test fixture creates rows,
 #: and only with ``owner_granted = 1`` — the CHECK constraint makes a
@@ -134,7 +160,7 @@ CREATE TABLE IF NOT EXISTS wire_wakes (
     priority INTEGER NOT NULL DEFAULT 5 CHECK (priority BETWEEN 1 AND 9),
     ttl_expires_at TEXT,
     state TEXT NOT NULL CHECK (state IN (
-        'pending', 'delivered', 'acknowledged', 'claimed',
+        'pending', 'delivered', 'claimed',
         'completed', 'failed', 'expired', 'cancelled', 'ambiguous')),
     created_at TEXT NOT NULL,
     delivered_at TEXT,
@@ -175,6 +201,20 @@ def _lease_is_live(lease_expires_at: str | None, now: datetime) -> bool:
         return _parse_iso(lease_expires_at) > now
     except ValueError:
         return False
+
+
+def _begin_immediate(conn: sqlite3.Connection) -> None:
+    """Open a real SQLite write transaction BEFORE any mutable-state read.
+
+    Python's legacy sqlite3 mode does NOT begin a transaction for SELECT
+    statements (Goblin R1: ``conn.in_transaction`` is false before the first
+    write), so read-check-write sequences built on plain SELECTs are racy:
+    another writer can commit between the check and this connection's first
+    write. Every wake read-check-write path calls this first so the whole
+    sequence is serialized against other writers from its first read.
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
 
 
 def _validated_capabilities(value: Any) -> dict[str, bool]:
@@ -337,6 +377,7 @@ class WakeStoreMixin:
         session_id = uuid.uuid4().hex
         registered_at = _utc_now()
         with self.connect() as conn:
+            _begin_immediate(conn)
             conn.execute(
                 """
                 INSERT INTO wire_sessions(
@@ -388,6 +429,7 @@ class WakeStoreMixin:
             raise WireError("state must be one of ready, busy, draining")
         now = _iso_now()
         with self.connect() as conn:
+            _begin_immediate(conn)
             row = conn.execute(
                 "SELECT * FROM wire_sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
@@ -419,6 +461,7 @@ class WakeStoreMixin:
 
     def unregister_session(self, *, seat: Seat, session_id: str) -> dict[str, Any]:
         with self.connect() as conn:
+            _begin_immediate(conn)
             row = conn.execute(
                 "SELECT * FROM wire_sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
@@ -440,23 +483,40 @@ class WakeStoreMixin:
         assert refreshed is not None
         return _session_dict(refreshed)
 
-    def list_sessions(self, *, seat: str | None = None) -> list[dict[str, Any]]:
+    def list_sessions(
+        self, *, seat: str | None = None, limit: int = MAX_WAKE_LIST_LIMIT
+    ) -> list[dict[str, Any]]:
+        """Registered sessions, bounded (R8: listing responses stay under the
+        transport frame limit)."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise WireError("limit must be a positive integer")
+        if limit > MAX_WAKE_LIST_LIMIT:
+            raise WireError(f"limit must not exceed {MAX_WAKE_LIST_LIMIT}")
         now = _iso_now()
         with self.connect() as conn:
             if seat is None:
                 rows = conn.execute(
-                    "SELECT * FROM wire_sessions ORDER BY registered_at ASC"
+                    "SELECT * FROM wire_sessions ORDER BY registered_at ASC, session_id ASC LIMIT ?",
+                    (limit,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM wire_sessions WHERE seat = ? ORDER BY registered_at ASC",
-                    (seat,),
+                    """SELECT * FROM wire_sessions WHERE seat = ?
+                       ORDER BY registered_at ASC, session_id ASC LIMIT ?""",
+                    (seat, limit),
                 ).fetchall()
         return [_session_dict(row, now=now) for row in rows]
 
     def live_sessions_for_seat(
         self, conn: sqlite3.Connection, seat: str, *, now: datetime
     ) -> list[sqlite3.Row]:
+        """Live sessions of a seat regardless of wake capability.
+
+        R3 revision: capability filtering lives with the callers that need it
+        (auto-resolution candidates, ack/claim enforcement), so a live session
+        that cannot acknowledge is classified ``unsupported`` rather than
+        silently disappearing into ``queued_offline``.
+        """
         rows = conn.execute(
             "SELECT * FROM wire_sessions WHERE seat = ? ORDER BY registered_at ASC",
             (seat,),
@@ -466,7 +526,6 @@ class WakeStoreMixin:
             for row in rows
             if row["state"] in LIVE_SESSION_STATES
             and _lease_is_live(row["lease_expires_at"], now)
-            and json.loads(row["capabilities"]).get("wake_ack", True)
         ]
 
     # ── tasks (operator-local creation only; no socket op creates these) ──
@@ -488,6 +547,7 @@ class WakeStoreMixin:
         if scope_text is not None and len(scope_text) > MAX_META_CHARS:
             raise WireError(f"scope exceeds {MAX_META_CHARS} characters")
         with self.connect() as conn:
+            _begin_immediate(conn)
             existing = conn.execute(
                 "SELECT task_id FROM wire_tasks WHERE task_id = ?", (ref,)
             ).fetchone()
@@ -525,6 +585,7 @@ class WakeStoreMixin:
         """Operator-local revocation. Defeats pending wakes at claim time."""
         note = _validated_optional_text(reason, field="reason", limit=MAX_NOTE_CHARS)
         with self.connect() as conn:
+            _begin_immediate(conn)
             row = conn.execute(
                 "SELECT * FROM wire_tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -545,7 +606,7 @@ class WakeStoreMixin:
                 UPDATE wire_wakes
                 SET state = 'cancelled',
                     last_error = COALESCE(?, last_error)
-                WHERE task_ref = ? AND state IN ('pending', 'delivered', 'acknowledged')
+                WHERE task_ref = ? AND state IN ('pending', 'delivered')
                 """,
                 ("task cancelled by operator", task_id),
             )
@@ -589,6 +650,14 @@ class WakeStoreMixin:
 
         The wake references an existing, open task or the request is refused:
         a wake can point at owner-granted work, never create it.
+
+        R7 revision: the authenticated idempotency lookup runs BEFORE new-intent
+        eligibility checks, so a retry after the task was claimed/cancelled
+        returns the persisted duplicate receipt instead of a task-state error;
+        conflicting reuse of a key (same key, different wake) is rejected
+        explicitly. R3 revision: live and wake-capable are decided separately
+        — a live session that did not declare ``wake_ack`` is ``unsupported``,
+        never mislabeled offline.
         """
         target = validate_name(target_seat, field="target_seat")
         ref = _validated_task_ref(task_ref)
@@ -616,6 +685,7 @@ class WakeStoreMixin:
             ).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
         with self.connect() as conn:
+            _begin_immediate(conn)
             seat_row = conn.execute(
                 "SELECT name FROM seats WHERE name = ?", (target,)
             ).fetchone()
@@ -626,9 +696,10 @@ class WakeStoreMixin:
             ).fetchone()
             if task_row is None:
                 raise WireError(f"unknown task_ref {ref!r}; a wake cannot create a task")
-            if task_row["state"] != "open":
-                raise WireError(f"task {ref!r} is {task_row['state']}, not open")
 
+            # R7: idempotent retries resolve against the persisted intent
+            # before any new-intent eligibility check, and conflicting reuse
+            # of a key is rejected instead of silently returning the old wake.
             if idempotency_key is not None:
                 existing = conn.execute(
                     """
@@ -638,7 +709,17 @@ class WakeStoreMixin:
                     (requester.name, idempotency_key),
                 ).fetchone()
                 if existing is not None:
+                    if (
+                        existing["task_ref"] != ref
+                        or existing["target_seat"] != target
+                    ):
+                        raise WireError(
+                            "idempotency_key is already bound to a different wake"
+                        )
                     return _wake_dict(existing), "duplicate", []
+
+            if task_row["state"] != "open":
+                raise WireError(f"task {ref!r} is {task_row['state']}, not open")
 
             candidates: list[str] = []
             resolved_session: sqlite3.Row | None = None
@@ -653,10 +734,21 @@ class WakeStoreMixin:
                     raise WireError("target session belongs to a different seat")
                 resolved_session = session_row
             else:
+                # R3: liveness and wake capability are independent facts. A
+                # live session that cannot acknowledge is unsupported, not
+                # offline; only wake-capable sessions are auto-resolution
+                # candidates.
                 live = self.live_sessions_for_seat(conn, target, now=now)
-                if len(live) == 1:
-                    resolved_session = live[0]
-                elif len(live) > 1:
+                capable = [
+                    row
+                    for row in live
+                    if json.loads(row["capabilities"]).get("wake_ack", True)
+                ]
+                if len(capable) == 1:
+                    resolved_session = capable[0]
+                elif len(capable) > 1:
+                    candidates = [row["session_id"] for row in capable]
+                elif live:
                     candidates = [row["session_id"] for row in live]
 
             if resolved_session is not None:
@@ -677,11 +769,26 @@ class WakeStoreMixin:
                     last_error = "target session is registered but not live"
                 target_session_id = resolved_session["session_id"]
             elif candidates:
-                state = "ambiguous"
-                resolution = "ambiguous"
-                last_error = (
-                    f"ambiguous: {len(candidates)} live sessions; name a target_session_id"
-                )
+                live_capable = [
+                    row
+                    for row in self.live_sessions_for_seat(conn, target, now=now)
+                    if json.loads(row["capabilities"]).get("wake_ack", True)
+                ]
+                if len(live_capable) > 1:
+                    state = "ambiguous"
+                    resolution = "ambiguous"
+                    last_error = (
+                        f"ambiguous: {len(candidates)} live wake-capable sessions; "
+                        "name a target_session_id"
+                    )
+                else:
+                    # Live sessions exist but none can acknowledge the wake.
+                    state = "failed"
+                    resolution = "unsupported"
+                    last_error = (
+                        f"no live session of seat {target!r} declared the "
+                        "wake_ack capability"
+                    )
             else:
                 state = "pending"
                 resolution = "queued_offline"
@@ -717,87 +824,166 @@ class WakeStoreMixin:
         assert row is not None
         return _wake_dict(row), resolution, candidates
 
-    def _expire_if_stale(self, conn: sqlite3.Connection, row: sqlite3.Row) -> sqlite3.Row:
-        """Lazily expire a wake whose TTL passed while still undelivered."""
-        if row["state"] in ("pending", "delivered", "acknowledged"):
-            ttl = row["ttl_expires_at"]
-            if ttl is not None and _parse_iso(ttl) <= _iso_now():
-                conn.execute(
-                    """
-                    UPDATE wire_wakes SET state = 'expired', last_error = 'wake ttl expired'
-                    WHERE wake_id = ?
-                    """,
-                    (row["wake_id"],),
-                )
-                refreshed = conn.execute(
-                    "SELECT * FROM wire_wakes WHERE wake_id = ?", (row["wake_id"],)
-                ).fetchone()
-                assert refreshed is not None
-                return refreshed
-        return row
+    def _expire_stale_wake(self, wake_id: str) -> None:
+        """Durably expire a wake whose TTL passed, in its own transaction.
+
+        R6 revision: expiry is a terminal state change, so it commits in its
+        own transaction BEFORE any caller's read-check-write transaction runs.
+        A later refusal (wrong seat, wrong session, already-claimed) can then
+        raise freely without rolling the honest expiry record back, and raw
+        stored state always agrees with what the API reports.
+        """
+        with self.connect() as conn:
+            _begin_immediate(conn)
+            row = conn.execute(
+                "SELECT state, ttl_expires_at FROM wire_wakes WHERE wake_id = ?",
+                (wake_id,),
+            ).fetchone()
+            if row is None:
+                return
+            if row["state"] in ("pending", "delivered"):
+                ttl = row["ttl_expires_at"]
+                if ttl is not None and _parse_iso(ttl) <= _iso_now():
+                    conn.execute(
+                        """
+                        UPDATE wire_wakes
+                        SET state = 'expired', last_error = 'wake ttl expired'
+                        WHERE wake_id = ? AND state IN ('pending', 'delivered')
+                        """,
+                        (wake_id,),
+                    )
 
     def get_wake(self, wake_id: str) -> dict[str, Any] | None:
+        self._expire_stale_wake(wake_id)
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
             ).fetchone()
-            if row is None:
-                return None
-            row = self._expire_if_stale(conn, row)
-        return _wake_dict(row)
+        return None if row is None else _wake_dict(row)
 
     def list_wakes(
-        self, *, seat: str, state: str | None = None
+        self,
+        *,
+        seat: str,
+        state: str | None = None,
+        limit: int = MAX_WAKE_LIST_LIMIT,
+        after_created_at: str | None = None,
+        after_wake_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Wakes addressed to this seat (as target) or requested by it."""
+        """Wakes addressed to this seat (as target) or requested by it.
+
+        R8 revision: keyset-paginated on (created_at, wake_id) and bounded —
+        a growing durable queue must never make its own recovery interface
+        unreadable through the transport frame limit. Callers wanting
+        has-more detection pass ``limit + 1`` and trim.
+        """
         if state is not None and state not in WAKE_STATES:
             raise WireError(f"unknown wake state {state!r}")
-        now = _iso_now()
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise WireError("limit must be a positive integer")
+        if limit > MAX_WAKE_LIST_LIMIT:
+            raise WireError(f"limit must not exceed {MAX_WAKE_LIST_LIMIT}")
+        if (after_created_at is None) != (after_wake_id is None):
+            raise WireError("after_created_at and after_wake_id must be given together")
+        self._expire_stale_batch(seat)
         with self.connect() as conn:
+            if after_created_at is not None:
+                cursor_sql = """
+                    AND (created_at > ? OR (created_at = ? AND wake_id > ?))
+                """
+                cursor_args: tuple[Any, ...] = (
+                    after_created_at,
+                    after_created_at,
+                    after_wake_id,
+                )
+            else:
+                cursor_sql = ""
+                cursor_args = ()
             if state is None:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM wire_wakes
-                    WHERE target_seat = ? OR requested_by = ?
-                    ORDER BY created_at ASC
+                    WHERE (target_seat = ? OR requested_by = ?){cursor_sql}
+                    ORDER BY created_at ASC, wake_id ASC
+                    LIMIT ?
                     """,
-                    (seat, seat),
+                    (seat, seat, *cursor_args, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM wire_wakes
-                    WHERE (target_seat = ? OR requested_by = ?) AND state = ?
-                    ORDER BY created_at ASC
+                    WHERE (target_seat = ? OR requested_by = ?) AND state = ?{cursor_sql}
+                    ORDER BY created_at ASC, wake_id ASC
+                    LIMIT ?
                     """,
-                    (seat, seat, state),
+                    (seat, seat, state, *cursor_args, limit),
                 ).fetchall()
-            result = []
-            for row in rows:
-                result.append(_wake_dict(self._expire_if_stale(conn, row)))
-        return result
+        return [_wake_dict(row) for row in rows]
+
+    def _expire_stale_batch(self, seat: str) -> None:
+        """Expire every stale wake visible to this seat, in one transaction.
+
+        Keeps listing/catch-up honest without per-row transactions; the batch
+        is bounded by the seat's own wake population and runs only on explicit
+        list/catch-up calls, never on the message fast path.
+        """
+        with self.connect() as conn:
+            _begin_immediate(conn)
+            conn.execute(
+                """
+                UPDATE wire_wakes
+                SET state = 'expired', last_error = 'wake ttl expired'
+                WHERE (target_seat = ? OR requested_by = ?)
+                  AND state IN ('pending', 'delivered')
+                  AND ttl_expires_at IS NOT NULL
+                  AND ttl_expires_at <= ?
+                """,
+                (seat, seat, _utc_now()),
+            )
 
     def pending_wakes_for_watch(
-        self, *, seat: str, session_id: str | None
+        self,
+        *,
+        seat: str,
+        session_id: str | None,
+        limit: int = PENDING_REPLAY_BATCH,
     ) -> list[dict[str, Any]]:
-        """Pending wakes this watcher should receive on subscribe.
+        """Pending wakes this watcher should receive on subscribe (READ-ONLY).
+
+        R2 revision: this method no longer marks anything delivered — a
+        durable delivery mark requires an adapter receipt (``wake_ack``), and
+        a frame write is only a transmission attempt recorded by the server
+        via :meth:`record_wake_attempt`. Unacknowledged wakes stay pending
+        and replay on every eligible subscription; redelivery is safe because
+        task claims are exactly-once.
 
         A bound watcher (``session_id`` set) receives seat-level wakes and
         wakes targeted at its own session. An unbound watcher receives only
         seat-level wakes; session-targeted wakes wait for a bound watch.
+        The batch is bounded (``limit``, default :data:`PENDING_REPLAY_BATCH`)
+        so one subscribe cycle cannot produce an unbounded frame burst;
+        anything beyond the batch remains pending for the next cycle.
+
         Task state is re-checked here: a wake whose task was cancelled or
-        completed while pending is marked failed instead of delivered.
+        completed while pending is marked failed (terminal mark, own
+        committed transaction) instead of being offered for delivery.
         """
-        now = _iso_now()
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise WireError("limit must be a positive integer")
+        if limit > PENDING_REPLAY_BATCH:
+            raise WireError(f"limit must not exceed {PENDING_REPLAY_BATCH}")
+        self._expire_stale_batch(seat)
         with self.connect() as conn:
             if session_id is None:
                 rows = conn.execute(
                     """
                     SELECT * FROM wire_wakes
                     WHERE target_seat = ? AND target_session_id IS NULL AND state = 'pending'
-                    ORDER BY priority ASC, created_at ASC
+                    ORDER BY priority ASC, created_at ASC, wake_id ASC
+                    LIMIT ?
                     """,
-                    (seat,),
+                    (seat, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -806,51 +992,50 @@ class WakeStoreMixin:
                     WHERE target_seat = ?
                       AND (target_session_id IS NULL OR target_session_id = ?)
                       AND state = 'pending'
-                    ORDER BY priority ASC, created_at ASC
+                    ORDER BY priority ASC, created_at ASC, wake_id ASC
+                    LIMIT ?
                     """,
-                    (seat, session_id),
+                    (seat, session_id, limit),
                 ).fetchall()
-            delivered: list[dict[str, Any]] = []
+            candidates: list[dict[str, Any]] = []
             for row in rows:
-                row = self._expire_if_stale(conn, row)
-                if row["state"] != "pending":
-                    continue
                 task_row = conn.execute(
                     "SELECT state FROM wire_tasks WHERE task_id = ?", (row["task_ref"],)
                 ).fetchone()
                 if task_row is None or task_row["state"] != "open":
-                    conn.execute(
-                        """
-                        UPDATE wire_wakes
-                        SET state = 'failed', last_error = ?
-                        WHERE wake_id = ? AND state = 'pending'
-                        """,
-                        (
-                            f"task no longer open ({'missing' if task_row is None else task_row['state']})",
-                            row["wake_id"],
-                        ),
+                    # Terminal refusal mark: committed in its own transaction
+                    # so it survives anything the caller does next (R6 rule).
+                    self._fail_pending_wake(
+                        row["wake_id"],
+                        f"task no longer open ({'missing' if task_row is None else task_row['state']})",
                     )
                     continue
-                conn.execute(
-                    """
-                    UPDATE wire_wakes
-                    SET state = 'delivered',
-                        delivered_at = COALESCE(delivered_at, ?),
-                        attempts = attempts + 1
-                    WHERE wake_id = ?
-                    """,
-                    (_utc_now(), row["wake_id"]),
-                )
-                refreshed = conn.execute(
-                    "SELECT * FROM wire_wakes WHERE wake_id = ?", (row["wake_id"],)
-                ).fetchone()
-                assert refreshed is not None
-                delivered.append(_wake_dict(refreshed))
-        return delivered
+                candidates.append(_wake_dict(row))
+        return candidates
 
-    def mark_wake_delivered(self, wake_id: str) -> dict[str, Any]:
-        """Record one live fanout delivery of a pending wake."""
+    def _fail_pending_wake(self, wake_id: str, error: str) -> None:
         with self.connect() as conn:
+            _begin_immediate(conn)
+            conn.execute(
+                """
+                UPDATE wire_wakes
+                SET state = 'failed', last_error = ?
+                WHERE wake_id = ? AND state = 'pending'
+                """,
+                (error, wake_id),
+            )
+
+    def record_wake_attempt(self, wake_id: str) -> dict[str, Any]:
+        """Record one transmission attempt of a pending wake.
+
+        R2/Sol revision: a successful socket frame write bumps ``attempts``
+        and nothing else. The durable state stays ``pending`` until an
+        authenticated adapter receipt (``wake_ack``) transitions it to
+        ``delivered`` — a frame handed to a socket buffer is a transport
+        observation, never a receiver acknowledgment.
+        """
+        with self.connect() as conn:
+            _begin_immediate(conn)
             row = conn.execute(
                 "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
             ).fetchone()
@@ -858,43 +1043,7 @@ class WakeStoreMixin:
                 raise WireError("unknown wake")
             if row["state"] == "pending":
                 conn.execute(
-                    """
-                    UPDATE wire_wakes
-                    SET state = 'delivered',
-                        delivered_at = COALESCE(delivered_at, ?),
-                        attempts = attempts + 1
-                    WHERE wake_id = ?
-                    """,
-                    (_utc_now(), wake_id),
-                )
-            elif row["state"] == "delivered":
-                conn.execute(
                     "UPDATE wire_wakes SET attempts = attempts + 1 WHERE wake_id = ?",
-                    (wake_id,),
-                )
-            refreshed = conn.execute(
-                "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
-            ).fetchone()
-        assert refreshed is not None
-        return _wake_dict(refreshed)
-
-    def revert_wake_delivery(self, wake_id: str) -> dict[str, Any]:
-        """Compensating action for a delivery mark whose fanout found no live
-        watcher (disconnect race). Restores the pending state and undoes this
-        call's attempt increment; refuses if the wake moved on since."""
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
-            ).fetchone()
-            if row is None:
-                raise WireError("unknown wake")
-            if row["state"] == "delivered" and row["attempts"] == 1:
-                conn.execute(
-                    """
-                    UPDATE wire_wakes
-                    SET state = 'pending', delivered_at = NULL, attempts = 0
-                    WHERE wake_id = ?
-                    """,
                     (wake_id,),
                 )
             refreshed = conn.execute(
@@ -906,14 +1055,25 @@ class WakeStoreMixin:
     def acknowledge_wake(
         self, *, seat: Seat, wake_id: str, session_id: str
     ) -> dict[str, Any]:
-        """Adapter-level receipt of the wake intent. NOT a resume proof."""
+        """Adapter-level receipt of the wake intent. NOT a resume proof.
+
+        R2/Sol revision: this is the ONLY transition into ``delivered``. A
+        successful frame write never reaches here — delivery is what an
+        authenticated adapter says it received, nothing less and nothing more.
+
+        R3/R4 revisions enforced at this boundary: the session must belong to
+        the seat, be the wake's addressed target, be live with a valid lease,
+        and have declared the ``wake_ack`` capability. Idempotent: acking an
+        already-delivered wake returns its record unchanged.
+        """
+        self._expire_stale_wake(wake_id)
         with self.connect() as conn:
+            _begin_immediate(conn)
             row = conn.execute(
                 "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
             ).fetchone()
             if row is None:
                 raise WireError("unknown wake")
-            row = self._expire_if_stale(conn, row)
             if row["target_seat"] != seat.name:
                 raise WireError("wake targets a different seat")
             if (
@@ -932,16 +1092,30 @@ class WakeStoreMixin:
                 raise WireError(
                     f"session is {session_row['state']}; an offline session cannot acknowledge"
                 )
-            if row["state"] == "acknowledged":
+            if session_row["state"] not in LIVE_SESSION_STATES or not _lease_is_live(
+                session_row["lease_expires_at"], _iso_now()
+            ):
+                # R4: an ack is a live-adapter receipt; a session whose lease
+                # has lapsed must heartbeat (or re-register) first.
+                raise WireError(
+                    "session lease expired; heartbeat or re-register before acknowledging"
+                )
+            if not json.loads(session_row["capabilities"]).get("wake_ack", True):
+                # R3: a session that declared wake_ack=false cannot receipt
+                # wakes; honoring the declaration is the point of declaring it.
+                raise WireError(
+                    "session did not declare the wake_ack capability; cannot acknowledge"
+                )
+            if row["state"] == "delivered":
                 refreshed = row
-            elif row["state"] in ("pending", "delivered"):
+            elif row["state"] == "pending":
                 conn.execute(
                     """
                     UPDATE wire_wakes
-                    SET state = 'acknowledged', acknowledged_at = ?
-                    WHERE wake_id = ?
+                    SET state = 'delivered', delivered_at = ?, acknowledged_at = ?
+                    WHERE wake_id = ? AND state = 'pending'
                     """,
-                    (_utc_now(), wake_id),
+                    (_utc_now(), _utc_now(), wake_id),
                 )
                 refreshed = conn.execute(
                     "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
@@ -956,27 +1130,36 @@ class WakeStoreMixin:
     ) -> dict[str, Any]:
         """Atomically claim the wake's task for one session. Exactly once.
 
-        Fencing applied at claim time, inside one transaction:
-        - the session must exist, belong to the seat, be live, and hold a
-          valid lease (a delayed wake arriving after lease expiry is
-          defeated here and the wake is marked expired);
+        Fencing applied at claim time, inside one BEGIN IMMEDIATE transaction
+        (R1/M1 revision: the whole read-check-write sequence is serialized
+        from its first read — legacy sqlite3 SELECTs do not open transactions,
+        which is exactly the gap the original M1 analysis missed):
+        - the session must exist, belong to the seat, be live, hold a valid
+          lease, and have declared the ``claim`` capability (R3);
         - the task must still be ``open`` (cancellation/revocation defeats
-          the claim);
-        - the guarded ``UPDATE ... WHERE state = 'open'`` wins for exactly
-          one caller; losers get an honest refusal.
+          the claim) and the guarded ``UPDATE ... WHERE state = 'open'`` wins
+          for exactly one caller — the guard is LOAD-BEARING, not redundant:
+          with it removed, a cancellation committing between the precheck read
+          and the write revives the cancelled task (Goblin's paired mutant
+          test kills the mutant; classification corrected from the original
+          W0 report's "equivalent survivor" to "coverage gap");
+        - a delayed wake arriving after lease expiry is defeated here and the
+          wake is durably marked expired (expiry committed in its own
+          transaction first, so the refusal cannot roll it back — R6).
         """
+        self._expire_stale_wake(wake_id)
         now = _iso_now()
         failure: str | None = None
         with self.connect() as conn:
+            _begin_immediate(conn)
             row = conn.execute(
                 "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
             ).fetchone()
             if row is None:
                 raise WireError("unknown wake")
-            row = self._expire_if_stale(conn, row)
             if row["target_seat"] != seat.name:
                 raise WireError("wake targets a different seat")
-            if row["state"] not in ("pending", "delivered", "acknowledged"):
+            if row["state"] not in CLAIMABLE_WAKE_STATES:
                 raise WireError(f"wake is {row['state']}; cannot claim")
             if (
                 row["target_session_id"] is not None
@@ -992,6 +1175,12 @@ class WakeStoreMixin:
                 raise WireError("session belongs to a different seat")
             if session_row["state"] not in LIVE_SESSION_STATES:
                 raise WireError(f"session is {session_row['state']}; cannot claim")
+            if not json.loads(session_row["capabilities"]).get("claim", True):
+                # R3: a session that declared claim=false cannot claim work;
+                # the declaration is honored at the boundary that matters.
+                raise WireError(
+                    "session did not declare the claim capability; cannot claim"
+                )
             if not _lease_is_live(session_row["lease_expires_at"], now):
                 # Fencing marks are recorded in THIS transaction and must
                 # survive the refusal, so the refusal is raised after the
@@ -1017,7 +1206,7 @@ class WakeStoreMixin:
                         """
                         UPDATE wire_wakes
                         SET state = 'failed', last_error = ?
-                        WHERE wake_id = ?
+                        WHERE wake_id = ? AND state IN ('pending', 'delivered')
                         """,
                         (
                             f"task no longer open ({task_row['state']}) at claim time",
@@ -1040,7 +1229,7 @@ class WakeStoreMixin:
                         """
                         UPDATE wire_wakes
                         SET state = 'failed', last_error = 'lost claim race; task claimed elsewhere'
-                        WHERE wake_id = ?
+                        WHERE wake_id = ? AND state IN ('pending', 'delivered')
                         """,
                         (wake_id,),
                     )
@@ -1054,7 +1243,7 @@ class WakeStoreMixin:
                     """
                     UPDATE wire_wakes
                     SET state = 'claimed', claimed_at = ?, claimed_by_session = ?
-                    WHERE wake_id = ?
+                    WHERE wake_id = ? AND state IN ('pending', 'delivered')
                     """,
                     (claimed_at, session_id, wake_id),
                 )
@@ -1090,7 +1279,18 @@ class WakeStoreMixin:
             raise WireError("outcome must be 'completed' or 'failed'")
         note_text = _validated_optional_text(note, field="note", limit=MAX_NOTE_CHARS)
         ref = _validated_task_ref(task_ref)
+        failure: str | None = None
         with self.connect() as conn:
+            # R1 revision: BEGIN IMMEDIATE serializes the read-check-write
+            # sequence from its first read (legacy SELECTs open no
+            # transaction), and the completion UPDATE is guarded on
+            # ``state = 'claimed'`` with a rowcount check. An operator
+            # cancellation that commits before the write therefore wins:
+            # the guarded UPDATE matches zero rows, the refusal is honest,
+            # and the cancellation reason survives. The old unguarded
+            # ``WHERE task_id = ?`` overwrote committed cancellations
+            # (Goblin's real-CLI race reproduction).
+            _begin_immediate(conn)
             task_row = conn.execute(
                 "SELECT * FROM wire_tasks WHERE task_id = ?", (ref,)
             ).fetchone()
@@ -1104,38 +1304,68 @@ class WakeStoreMixin:
             if session_row is None or session_row["seat"] != seat.name:
                 raise WireError("session belongs to a different seat")
             if task_row["state"] in ("cancelled", "revoked"):
-                raise WireError(f"task was {task_row['state']}; completion refused")
-            if task_row["state"] != "claimed":
-                raise WireError(f"task is {task_row['state']}; cannot complete")
-            completed_at = _utc_now()
-            conn.execute(
-                """
-                UPDATE wire_tasks
-                SET state = ?, completed_at = ?, outcome_note = ?
-                WHERE task_id = ?
-                """,
-                (outcome, completed_at, note_text, ref),
-            )
-            conn.execute(
-                """
-                UPDATE wire_wakes
-                SET state = ?
-                WHERE task_ref = ? AND claimed_by_session = ?
-                  AND state = 'claimed'
-                """,
-                (outcome, ref, session_id),
-            )
-            task_row = conn.execute(
-                "SELECT * FROM wire_tasks WHERE task_id = ?", (ref,)
-            ).fetchone()
-            wake_row = conn.execute(
-                """
-                SELECT * FROM wire_wakes
-                WHERE task_ref = ? AND claimed_by_session = ?
-                ORDER BY created_at ASC LIMIT 1
-                """,
-                (ref, session_id),
-            ).fetchone()
+                # Terminal refusal with a durable receipt: the claimant's wake
+                # is marked failed so the pipeline records why completion
+                # never happened. Mark + commit, raise after (R6 rule).
+                conn.execute(
+                    """
+                    UPDATE wire_wakes
+                    SET state = 'failed', last_error = ?
+                    WHERE task_ref = ? AND claimed_by_session = ?
+                      AND state = 'claimed'
+                    """,
+                    (f"task was {task_row['state']} before completion", ref, session_id),
+                )
+                failure = f"task was {task_row['state']}; completion refused"
+            elif task_row["state"] != "claimed":
+                failure = f"task is {task_row['state']}; cannot complete"
+            if failure is None:
+                completed_at = _utc_now()
+                cursor = conn.execute(
+                    """
+                    UPDATE wire_tasks
+                    SET state = ?, completed_at = ?, outcome_note = ?
+                    WHERE task_id = ? AND state = 'claimed'
+                    """,
+                    (outcome, completed_at, note_text, ref),
+                )
+                if cursor.rowcount != 1:
+                    # Lost the race against a committed cancellation between
+                    # our read and our write (possible only without BEGIN
+                    # IMMEDIATE; kept as second-layer defense).
+                    conn.execute(
+                        """
+                        UPDATE wire_wakes
+                        SET state = 'failed', last_error = 'task no longer claimed at completion; operator cancellation won'
+                        WHERE task_ref = ? AND claimed_by_session = ?
+                          AND state = 'claimed'
+                        """,
+                        (ref, session_id),
+                    )
+                    failure = "task no longer claimed; completion refused"
+            if failure is None:
+                conn.execute(
+                    """
+                    UPDATE wire_wakes
+                    SET state = ?
+                    WHERE task_ref = ? AND claimed_by_session = ?
+                      AND state = 'claimed'
+                    """,
+                    (outcome, ref, session_id),
+                )
+                task_row = conn.execute(
+                    "SELECT * FROM wire_tasks WHERE task_id = ?", (ref,)
+                ).fetchone()
+                wake_row = conn.execute(
+                    """
+                    SELECT * FROM wire_wakes
+                    WHERE task_ref = ? AND claimed_by_session = ?
+                    ORDER BY created_at ASC LIMIT 1
+                    """,
+                    (ref, session_id),
+                ).fetchone()
+        if failure is not None:
+            raise WireError(failure)
         assert task_row is not None
         return {
             "task": _task_dict(task_row),

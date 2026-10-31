@@ -27,6 +27,7 @@ from .protocol import (
     validate_read_limit,
 )
 from .storage import PeerCredentials, Seat, WireStore
+from .wake import MAX_WAKE_LIST_LIMIT
 
 LOG = logging.getLogger("aivengers_wire")
 
@@ -373,8 +374,12 @@ class WireServer:
             )
             return {"session": session}
         if op == "sessions":
-            require_exact_keys(request, required={"op"})
-            return {"sessions": self.store.list_sessions(seat=seat.name)}
+            require_exact_keys(request, required={"op"}, optional={"limit"})
+            limit = request.get("limit", MAX_WAKE_LIST_LIMIT)
+            return {
+                "sessions": self.store.list_sessions(seat=seat.name, limit=limit),
+                "has_more": False,
+            }
         if op == "wake":
             require_exact_keys(
                 request,
@@ -398,15 +403,17 @@ class WireServer:
                 note=request.get("note"),
             )
             if resolution == "deliverable":
-                # Mark delivered first so the event frame carries the truthful
-                # post-transition record (state=delivered, attempts counted).
-                # If no bound watcher is actually live anymore (disconnect
-                # race), revert the mark and report ``queued`` honestly.
-                wake = self.store.mark_wake_delivered(wake["wake_id"])
+                # R2/Sol revision: a successful frame write is a TRANSMISSION
+                # attempt, recorded as such (attempts+1) — never a durable
+                # delivery mark. The wake stays pending until an authenticated
+                # adapter receipt (wake_ack) transitions it to delivered, so
+                # unacknowledged wakes replay on reconnect. No disconnect race
+                # can strand a phantom "delivered" state because none is
+                # written here.
                 if self._fanout_wake(wake):
-                    resolution = "delivered"
+                    wake = self.store.record_wake_attempt(wake["wake_id"])
+                    resolution = "transmitted"
                 else:
-                    wake = self.store.revert_wake_delivery(wake["wake_id"])
                     resolution = "queued"
             return {"wake": wake, "resolution": resolution, "candidates": candidates}
         if op == "wake_ack":
@@ -442,8 +449,44 @@ class WireServer:
                 raise WireError("wake is not addressed to this seat")
             return {"wake": wake}
         if op == "wake_list":
-            require_exact_keys(request, required={"op"}, optional={"state"})
-            return {"wakes": self.store.list_wakes(seat=seat.name, state=request.get("state"))}
+            require_exact_keys(
+                request,
+                required={"op"},
+                optional={"state", "limit", "after_created_at", "after_wake_id"},
+            )
+            state = request.get("state")
+            limit = request.get("limit", MAX_WAKE_LIST_LIMIT)
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ProtocolError("limit must be a positive integer")
+            if limit > MAX_WAKE_LIST_LIMIT:
+                raise ProtocolError(
+                    f"limit must not exceed {MAX_WAKE_LIST_LIMIT}"
+                )
+            # Fetch one extra row for honest has-more detection; the store
+            # caps at MAX_WAKE_LIST_LIMIT, so at the cap the flag is
+            # conservative (may report more when exactly `limit` remain).
+            fetch = min(limit + 1, MAX_WAKE_LIST_LIMIT)
+            rows = self.store.list_wakes(
+                seat=seat.name,
+                state=state,
+                limit=fetch,
+                after_created_at=request.get("after_created_at"),
+                after_wake_id=request.get("after_wake_id"),
+            )
+            has_more = len(rows) > limit
+            page = rows[:limit]
+            next_after = None
+            if has_more and page:
+                last = page[-1]
+                next_after = {
+                    "created_at": last["created_at"],
+                    "wake_id": last["wake_id"],
+                }
+            return {
+                "wakes": page,
+                "has_more": has_more,
+                "next_after": next_after,
+            }
         raise ProtocolError(f"unsupported operation: {op!r}")
 
     # ── watch: authenticated real-time notification subscription ──────────
@@ -477,6 +520,14 @@ class WireServer:
                 raise WireError("unknown session")
             if session["seat"] != seat.name:
                 raise WireError("session belongs to a different seat")
+            if not session["lease_live"]:
+                # R4: a retired/offline/expired session cannot bind a watcher
+                # and consume its targeted queued wakes; the adapter must
+                # register a current session instead.
+                raise WireError(
+                    f"session is {session['state']} and not lease-live; "
+                    "register a new session to watch as a wake target"
+                )
             session_id = session_id_value
         channels_value = request.get("channels")
         if channels_value is None:
@@ -655,6 +706,13 @@ class WireServer:
         Runs immediately after the ``subscribed`` ack is flushed, so the
         client observes ack first, then catch-up wake events, then live
         traffic — the same subscribe-then-catch-up shape as message history.
+
+        R2 revision: the batch is read-only and bounded
+        (:data:`PENDING_REPLAY_BATCH` via the store); each successful frame
+        write records a transmission attempt and NOTHING else — the wake
+        stays pending until its adapter acks, so an overflow or disconnect
+        here loses nothing: unwritten wakes remain pending and replay on the
+        next subscription. Marking must never outrun writing.
         """
 
         subscription = self._subscribers.get(writer)
@@ -663,6 +721,7 @@ class WireServer:
         wakes = self.store.pending_wakes_for_watch(
             seat=seat.name, session_id=subscription.session_id
         )
+        written = 0
         for wake in wakes:
             frame = encode_frame({"ok": True, "event": "wake", "wake": wake})
             transport = writer.transport
@@ -675,9 +734,13 @@ class WireServer:
             except Exception:
                 self._drop_subscriber_now(writer, wake["wake_id"], reason="unwritable")
                 return
-        if wakes:
+            # Attempt recorded only after the write was accepted; the wake's
+            # durable state is untouched (pending until wake_ack).
+            self.store.record_wake_attempt(wake["wake_id"])
+            written += 1
+        if written:
             LOG.info(
-                "pending wakes delivered seat=%r count=%d", seat.name, len(wakes)
+                "pending wakes transmitted seat=%r count=%d", seat.name, written
             )
 
 

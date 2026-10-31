@@ -291,9 +291,26 @@ class WireClient:
         """Fetch one wake's exact pipeline position (target/requester only)."""
         return self.request({"op": "wake_status", "wake_id": wake_id})["wake"]
 
-    def wake_list(self, *, state: str | None = None) -> list[dict[str, Any]]:
-        """List wakes addressed to or requested by this seat (catch-up path)."""
+    def wake_list(
+        self,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+        after_created_at: str | None = None,
+        after_wake_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List wakes addressed to or requested by this seat (catch-up path).
+
+        R8: keyset-paginated and bounded; pass ``after_*`` values from the
+        server's ``next_after`` to walk a backlog beyond one page.
+        """
         payload: dict[str, Any] = {"op": "wake_list"}
         if state is not None:
             payload["state"] = state
+        if limit is not None:
+            payload["limit"] = limit
+        if after_created_at is not None:
+            payload["after_created_at"] = after_created_at
+        if after_wake_id is not None:
+            payload["after_wake_id"] = after_wake_id
         return self.request(payload)["wakes"]

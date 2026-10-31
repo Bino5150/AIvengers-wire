@@ -183,6 +183,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_client_options(wake_list)
     wake_list.add_argument("--state")
+    wake_list.add_argument("--limit", type=int)
+    wake_list.add_argument("--after-created-at")
+    wake_list.add_argument("--after-wake-id")
 
     task = subparsers.add_parser(
         "task", help="manage owner-granted tasks (local operator only)"
@@ -262,6 +265,31 @@ def execute(args: argparse.Namespace) -> int:
         asyncio.run(run_server(store))
         return 0
 
+    if args.command == "task" and args.task_command == "add":
+        store.initialize()
+        scope = None
+        if args.scope is not None:
+            scope = json.loads(args.scope)
+            if not isinstance(scope, dict):
+                raise WireError("--scope must be a JSON object")
+        task = store.add_task(
+            task_id=args.task_id, title=args.title, scope=scope
+        )
+        _emit(
+            {"task": task, "note": "created locally; peers cannot create tasks"},
+            as_json=args.json,
+        )
+        return 0
+    if args.command == "task" and args.task_command == "list":
+        store.initialize()
+        tasks = store.list_tasks()
+        _emit({"tasks": tasks} if args.json else tasks, as_json=args.json)
+        return 0
+    if args.command == "task" and args.task_command == "cancel":
+        store.initialize()
+        task = store.cancel_task(task_id=args.task_id, reason=args.reason)
+        _emit({"task": task} if args.json else task, as_json=args.json)
+        return 0
     client = _client(args, store)
     if args.command == "ping":
         response = client.request({"op": "ping"})
@@ -411,33 +439,28 @@ def execute(args: argparse.Namespace) -> int:
         payload = {"op": "wake_list"}
         if args.state is not None:
             payload["state"] = args.state
+        if args.limit is not None:
+            payload["limit"] = args.limit
+        if args.after_created_at is not None:
+            payload["after_created_at"] = args.after_created_at
+        if args.after_wake_id is not None:
+            payload["after_wake_id"] = args.after_wake_id
         response = client.request(payload)
-        _emit(response if args.json else response["wakes"], as_json=args.json)
-        return 0
-    if args.command == "task" and args.task_command == "add":
-        store.initialize()
-        scope = None
-        if args.scope is not None:
-            scope = json.loads(args.scope)
-            if not isinstance(scope, dict):
-                raise WireError("--scope must be a JSON object")
-        task = store.add_task(
-            task_id=args.task_id, title=args.title, scope=scope
-        )
-        _emit(
-            {"task": task, "note": "created locally; peers cannot create tasks"},
-            as_json=args.json,
-        )
-        return 0
-    if args.command == "task" and args.task_command == "list":
-        store.initialize()
-        tasks = store.list_tasks()
-        _emit({"tasks": tasks} if args.json else tasks, as_json=args.json)
-        return 0
-    if args.command == "task" and args.task_command == "cancel":
-        store.initialize()
-        task = store.cancel_task(task_id=args.task_id, reason=args.reason)
-        _emit({"task": task} if args.json else task, as_json=args.json)
+        if args.json:
+            _emit(response, as_json=True)
+        else:
+            for wake in response["wakes"]:
+                print(
+                    f"{wake['wake_id'][:12]} {wake['state']:>10} task={wake['task_ref']} "
+                    f"target={wake.get('target_session_id') or wake['target_seat']} "
+                    f"attempts={wake['attempts']}"
+                )
+            if response.get("has_more"):
+                nxt = response.get("next_after") or {}
+                print(
+                    f"-- more available; continue with --after-created-at "
+                    f"{nxt.get('created_at')} --after-wake-id {nxt.get('wake_id')}"
+                )
         return 0
     raise WireError(f"unsupported command: {args.command}")
 
