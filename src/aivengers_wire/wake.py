@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS wire_wakes (
     wake_id TEXT PRIMARY KEY,
     target_seat TEXT NOT NULL REFERENCES seats(name),
     target_session_id TEXT REFERENCES wire_sessions(session_id),
+    requested_target_session_id TEXT,
     task_ref TEXT NOT NULL REFERENCES wire_tasks(task_id),
     requested_by TEXT NOT NULL REFERENCES seats(name),
     idempotency_key TEXT,
@@ -274,6 +275,7 @@ def _wake_dict(row: sqlite3.Row) -> dict[str, Any]:
         "wake_id": row["wake_id"],
         "target_seat": row["target_seat"],
         "target_session_id": row["target_session_id"],
+        "requested_target_session_id": row["requested_target_session_id"],
         "task_ref": row["task_ref"],
         "requested_by": row["requested_by"],
         "idempotency_key": row["idempotency_key"],
@@ -326,6 +328,23 @@ class WakeStoreMixin:
 
         def run(c: sqlite3.Connection) -> None:
             c.executescript(WAKE_SCHEMA_SQL)
+            # T4: ``requested_target_session_id`` (the caller's EXPLICIT
+            # target, None when resolution was implicit) is part of the
+            # stable idempotency identity. ``CREATE TABLE IF NOT EXISTS``
+            # cannot add a column to a database created by the R2 candidate,
+            # so the column is added by a guarded ALTER for any store that
+            # predates it. No legacy rows exist in the wild yet (production
+            # still runs pre-wake code), so backfill is unnecessary; the
+            # schema-version/migration story remains an explicit release
+            # gate, unchanged from the W0 report.
+            cols = {
+                row[1]
+                for row in c.execute("PRAGMA table_info(wire_wakes)").fetchall()
+            }
+            if "requested_target_session_id" not in cols:
+                c.execute(
+                    "ALTER TABLE wire_wakes ADD COLUMN requested_target_session_id TEXT"
+                )
 
         if conn is not None:
             run(conn)
@@ -370,14 +389,17 @@ class WakeStoreMixin:
             if len(meta_text) > MAX_META_CHARS:
                 raise WireError(f"meta exceeds {MAX_META_CHARS} characters")
 
-        now = _iso_now()
-        expires = (now + timedelta(seconds=lease_seconds)).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z")
         session_id = uuid.uuid4().hex
         registered_at = _utc_now()
         with self.connect() as conn:
             _begin_immediate(conn)
+            # T1 audit: the lease window starts when the row is actually
+            # written, not when the call began — a lock wait must not
+            # consume the granted lease.
+            now = _iso_now()
+            expires = (now + timedelta(seconds=lease_seconds)).isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
             conn.execute(
                 """
                 INSERT INTO wire_sessions(
@@ -427,9 +449,12 @@ class WakeStoreMixin:
     ) -> dict[str, Any]:
         if state is not None and state not in ("ready", "busy", "draining"):
             raise WireError("state must be one of ready, busy, draining")
-        now = _iso_now()
         with self.connect() as conn:
             _begin_immediate(conn)
+            # T1 audit: the renewed lease window starts when the row is
+            # actually written, not when the call began — a lock wait must
+            # not consume the granted lease.
+            now = _iso_now()
             row = conn.execute(
                 "SELECT * FROM wire_sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
@@ -484,26 +509,61 @@ class WakeStoreMixin:
         return _session_dict(refreshed)
 
     def list_sessions(
-        self, *, seat: str | None = None, limit: int = MAX_WAKE_LIST_LIMIT
+        self,
+        *,
+        seat: str | None = None,
+        limit: int = MAX_WAKE_LIST_LIMIT,
+        after_registered_at: str | None = None,
+        after_session_id: str | None = None,
+        include_sentinel: bool = False,
     ) -> list[dict[str, Any]]:
-        """Registered sessions, bounded (R8: listing responses stay under the
-        transport frame limit)."""
+        """Registered sessions, bounded (R8) and keyset-paginated (T2).
+
+        T2: the session listing previously hardcoded ``has_more=false`` with
+        no continuation, so a 101-session seat reported 100 rows as the
+        complete set. ``include_sentinel=True`` fetches one extra row for
+        truthful has-more detection, and the ``after_*`` pair walks the
+        remainder on the same (timestamp, id) keyset as wake listing.
+        """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise WireError("limit must be a positive integer")
         if limit > MAX_WAKE_LIST_LIMIT:
             raise WireError(f"limit must not exceed {MAX_WAKE_LIST_LIMIT}")
+        if (after_registered_at is None) != (after_session_id is None):
+            raise WireError(
+                "after_registered_at and after_session_id must be given together"
+            )
+        fetch = limit + 1 if include_sentinel else limit
         now = _iso_now()
         with self.connect() as conn:
+            if after_registered_at is not None:
+                cursor_sql = """
+                    AND (registered_at > ? OR (registered_at = ? AND session_id > ?))
+                """
+                cursor_args: tuple[Any, ...] = (
+                    after_registered_at,
+                    after_registered_at,
+                    after_session_id,
+                )
+            else:
+                cursor_sql = ""
+                cursor_args = ()
             if seat is None:
                 rows = conn.execute(
-                    "SELECT * FROM wire_sessions ORDER BY registered_at ASC, session_id ASC LIMIT ?",
-                    (limit,),
+                    f"""
+                    SELECT * FROM wire_sessions
+                    WHERE 1 = 1{cursor_sql}
+                    ORDER BY registered_at ASC, session_id ASC LIMIT ?
+                    """,
+                    (*cursor_args, fetch),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT * FROM wire_sessions WHERE seat = ?
-                       ORDER BY registered_at ASC, session_id ASC LIMIT ?""",
-                    (seat, limit),
+                    f"""
+                    SELECT * FROM wire_sessions WHERE seat = ?{cursor_sql}
+                    ORDER BY registered_at ASC, session_id ASC LIMIT ?
+                    """,
+                    (seat, *cursor_args, fetch),
                 ).fetchall()
         return [_session_dict(row, now=now) for row in rows]
 
@@ -676,16 +736,22 @@ class WakeStoreMixin:
             if ttl_seconds > MAX_WAKE_TTL_SECONDS:
                 raise WireError(f"ttl_seconds must not exceed {MAX_WAKE_TTL_SECONDS}")
         note_text = _validated_optional_text(note, field="note", limit=MAX_NOTE_CHARS)
-
-        now = _iso_now()
-        ttl_expires_at = None
-        if ttl_seconds is not None:
-            ttl_expires_at = (
-                now + timedelta(seconds=ttl_seconds)
-            ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        # T4: the caller's EXPLICIT target session is part of the stable
+        # request identity. Captured before target resolution, which reuses
+        # the ``target_session_id`` local for the RESOLVED session.
+        explicit_target = target_session_id
 
         with self.connect() as conn:
             _begin_immediate(conn)
+            # T1 audit: creation time is sampled AFTER the final write lock
+            # is held, so a lock wait can neither lengthen the granted TTL
+            # nor stale the liveness classification below.
+            now = _iso_now()
+            ttl_expires_at = None
+            if ttl_seconds is not None:
+                ttl_expires_at = (
+                    now + timedelta(seconds=ttl_seconds)
+                ).isoformat(timespec="microseconds").replace("+00:00", "Z")
             seat_row = conn.execute(
                 "SELECT name FROM seats WHERE name = ?", (target,)
             ).fetchone()
@@ -715,6 +781,20 @@ class WakeStoreMixin:
                     ):
                         raise WireError(
                             "idempotency_key is already bound to a different wake"
+                        )
+                    # T4: the stable request identity includes the explicit
+                    # target session (None when the original resolved
+                    # implicitly). A retry naming a different explicit
+                    # session is a CONFLICTING intent, not a duplicate: it
+                    # is rejected instead of silently returning the first
+                    # wake's receipt. Exact retries — same explicit target,
+                    # or implicit/implicit — return the persisted wake
+                    # unchanged, and the persisted target is never
+                    # re-resolved against today's sessions.
+                    if existing["requested_target_session_id"] != explicit_target:
+                        raise WireError(
+                            "idempotency_key is bound to a wake with a "
+                            "different explicit target session"
                         )
                     return _wake_dict(existing), "duplicate", []
 
@@ -801,8 +881,9 @@ class WakeStoreMixin:
                 INSERT INTO wire_wakes(
                     wake_id, target_seat, target_session_id, task_ref,
                     requested_by, idempotency_key, priority, ttl_expires_at,
+                    requested_target_session_id,
                     state, created_at, attempts, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 """,
                 (
                     wake_id,
@@ -813,6 +894,7 @@ class WakeStoreMixin:
                     idempotency_key,
                     priority,
                     ttl_expires_at,
+                    explicit_target,
                     state,
                     _utc_now(),
                     last_error,
@@ -869,13 +951,20 @@ class WakeStoreMixin:
         limit: int = MAX_WAKE_LIST_LIMIT,
         after_created_at: str | None = None,
         after_wake_id: str | None = None,
+        include_sentinel: bool = False,
     ) -> list[dict[str, Any]]:
         """Wakes addressed to this seat (as target) or requested by it.
 
         R8 revision: keyset-paginated on (created_at, wake_id) and bounded —
         a growing durable queue must never make its own recovery interface
-        unreadable through the transport frame limit. Callers wanting
-        has-more detection pass ``limit + 1`` and trim.
+        unreadable through the transport frame limit.
+
+        T2 revision: ``include_sentinel=True`` fetches ``limit + 1`` rows so
+        the caller can detect has-more TRUTHFULLY at the public count cap.
+        The old server pattern (``fetch = min(limit + 1, cap)``) capped the
+        fetch AT the cap, so a default/max page could never see the sentinel
+        and reported ``has_more=false`` with half the queue unread — false
+        completeness, not conservative reporting.
         """
         if state is not None and state not in WAKE_STATES:
             raise WireError(f"unknown wake state {state!r}")
@@ -885,6 +974,7 @@ class WakeStoreMixin:
             raise WireError(f"limit must not exceed {MAX_WAKE_LIST_LIMIT}")
         if (after_created_at is None) != (after_wake_id is None):
             raise WireError("after_created_at and after_wake_id must be given together")
+        fetch = limit + 1 if include_sentinel else limit
         self._expire_stale_batch(seat)
         with self.connect() as conn:
             if after_created_at is not None:
@@ -907,7 +997,7 @@ class WakeStoreMixin:
                     ORDER BY created_at ASC, wake_id ASC
                     LIMIT ?
                     """,
-                    (seat, seat, *cursor_args, limit),
+                    (seat, seat, *cursor_args, fetch),
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -917,7 +1007,7 @@ class WakeStoreMixin:
                     ORDER BY created_at ASC, wake_id ASC
                     LIMIT ?
                     """,
-                    (seat, seat, state, *cursor_args, limit),
+                    (seat, seat, state, *cursor_args, fetch),
                 ).fetchall()
         return [_wake_dict(row) for row in rows]
 
@@ -1067,6 +1157,8 @@ class WakeStoreMixin:
         already-delivered wake returns its record unchanged.
         """
         self._expire_stale_wake(wake_id)
+        failure: str | None = None
+        refreshed: sqlite3.Row | None = None
         with self.connect() as conn:
             _begin_immediate(conn)
             row = conn.execute(
@@ -1081,47 +1173,68 @@ class WakeStoreMixin:
                 and row["target_session_id"] != session_id
             ):
                 raise WireError("wake targets a different session of this seat")
-            session_row = conn.execute(
-                "SELECT * FROM wire_sessions WHERE session_id = ?", (session_id,)
-            ).fetchone()
-            if session_row is None:
-                raise WireError("unknown session")
-            if session_row["seat"] != seat.name:
-                raise WireError("session belongs to a different seat")
-            if session_row["state"] in ("offline", "expired", "revoked"):
-                raise WireError(
-                    f"session is {session_row['state']}; an offline session cannot acknowledge"
-                )
-            if session_row["state"] not in LIVE_SESSION_STATES or not _lease_is_live(
-                session_row["lease_expires_at"], _iso_now()
-            ):
-                # R4: an ack is a live-adapter receipt; a session whose lease
-                # has lapsed must heartbeat (or re-register) first.
-                raise WireError(
-                    "session lease expired; heartbeat or re-register before acknowledging"
-                )
-            if not json.loads(session_row["capabilities"]).get("wake_ack", True):
-                # R3: a session that declared wake_ack=false cannot receipt
-                # wakes; honoring the declaration is the point of declaring it.
-                raise WireError(
-                    "session did not declare the wake_ack capability; cannot acknowledge"
-                )
-            if row["state"] == "delivered":
-                refreshed = row
-            elif row["state"] == "pending":
-                conn.execute(
-                    """
-                    UPDATE wire_wakes
-                    SET state = 'delivered', delivered_at = ?, acknowledged_at = ?
-                    WHERE wake_id = ? AND state = 'pending'
-                    """,
-                    (_utc_now(), _utc_now(), wake_id),
-                )
-                refreshed = conn.execute(
-                    "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
+            # T1: the wake TTL is revalidated INSIDE the admitting
+            # transaction. The preflight expiry pass ran before the write
+            # lock was held; a TTL that lapsed during the lock wait must be
+            # caught here, and the terminal expiry mark commits before the
+            # refusal raises (R6 rule).
+            if row["state"] in ("pending", "delivered"):
+                ttl = row["ttl_expires_at"]
+                if ttl is not None and _parse_iso(ttl) <= _iso_now():
+                    conn.execute(
+                        """
+                        UPDATE wire_wakes
+                        SET state = 'expired',
+                            last_error = 'wake ttl expired at ack admission'
+                        WHERE wake_id = ? AND state IN ('pending', 'delivered')
+                        """,
+                        (wake_id,),
+                    )
+                    failure = "wake ttl expired; cannot acknowledge"
+            if failure is None:
+                session_row = conn.execute(
+                    "SELECT * FROM wire_sessions WHERE session_id = ?", (session_id,)
                 ).fetchone()
-            else:
-                raise WireError(f"wake is {row['state']}; cannot acknowledge")
+                if session_row is None:
+                    raise WireError("unknown session")
+                if session_row["seat"] != seat.name:
+                    raise WireError("session belongs to a different seat")
+                if session_row["state"] in ("offline", "expired", "revoked"):
+                    raise WireError(
+                        f"session is {session_row['state']}; an offline session cannot acknowledge"
+                    )
+                if session_row["state"] not in LIVE_SESSION_STATES or not _lease_is_live(
+                    session_row["lease_expires_at"], _iso_now()
+                ):
+                    # R4: an ack is a live-adapter receipt; a session whose lease
+                    # has lapsed must heartbeat (or re-register) first.
+                    raise WireError(
+                        "session lease expired; heartbeat or re-register before acknowledging"
+                    )
+                if not json.loads(session_row["capabilities"]).get("wake_ack", True):
+                    # R3: a session that declared wake_ack=false cannot receipt
+                    # wakes; honoring the declaration is the point of declaring it.
+                    raise WireError(
+                        "session did not declare the wake_ack capability; cannot acknowledge"
+                    )
+                if row["state"] == "delivered":
+                    refreshed = row
+                elif row["state"] == "pending":
+                    conn.execute(
+                        """
+                        UPDATE wire_wakes
+                        SET state = 'delivered', delivered_at = ?, acknowledged_at = ?
+                        WHERE wake_id = ? AND state = 'pending'
+                        """,
+                        (_utc_now(), _utc_now(), wake_id),
+                    )
+                    refreshed = conn.execute(
+                        "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
+                    ).fetchone()
+                else:
+                    raise WireError(f"wake is {row['state']}; cannot acknowledge")
+        if failure is not None:
+            raise WireError(failure)
         assert refreshed is not None
         return _wake_dict(refreshed)
 
@@ -1148,10 +1261,16 @@ class WakeStoreMixin:
           transaction first, so the refusal cannot roll it back — R6).
         """
         self._expire_stale_wake(wake_id)
-        now = _iso_now()
         failure: str | None = None
         with self.connect() as conn:
             _begin_immediate(conn)
+            # T1: admission time is sampled AFTER the final write lock is
+            # held. Sampling before ``BEGIN IMMEDIATE`` let a real lock wait
+            # (1.4s measured by the reviewer) admit a session whose 1s lease
+            # had lapsed and a wake whose TTL had lapsed: the lease test
+            # compared against the pre-lock clock, and the wake TTL was
+            # never rechecked inside the admitting transaction at all.
+            now = _iso_now()
             row = conn.execute(
                 "SELECT * FROM wire_wakes WHERE wake_id = ?", (wake_id,)
             ).fetchone()
@@ -1166,35 +1285,53 @@ class WakeStoreMixin:
                 and row["target_session_id"] != session_id
             ):
                 raise WireError("wake targets a different session of this seat")
-            session_row = conn.execute(
-                "SELECT * FROM wire_sessions WHERE session_id = ?", (session_id,)
-            ).fetchone()
-            if session_row is None:
-                raise WireError("unknown session")
-            if session_row["seat"] != seat.name:
-                raise WireError("session belongs to a different seat")
-            if session_row["state"] not in LIVE_SESSION_STATES:
-                raise WireError(f"session is {session_row['state']}; cannot claim")
-            if not json.loads(session_row["capabilities"]).get("claim", True):
-                # R3: a session that declared claim=false cannot claim work;
-                # the declaration is honored at the boundary that matters.
-                raise WireError(
-                    "session did not declare the claim capability; cannot claim"
-                )
-            if not _lease_is_live(session_row["lease_expires_at"], now):
-                # Fencing marks are recorded in THIS transaction and must
-                # survive the refusal, so the refusal is raised after the
-                # transaction commits (raising inside the ``with`` block
-                # would roll the honest expiry record back).
+            # T1: the wake TTL is revalidated INSIDE the admitting
+            # transaction, against the locked row and the post-lock clock.
+            # The terminal expiry mark commits before the refusal raises
+            # (R6 rule), so raw stored state always agrees with the API.
+            ttl = row["ttl_expires_at"]
+            if ttl is not None and _parse_iso(ttl) <= now:
                 conn.execute(
                     """
                     UPDATE wire_wakes
-                    SET state = 'expired', last_error = 'session lease expired at claim time'
-                    WHERE wake_id = ?
+                    SET state = 'expired',
+                        last_error = 'wake ttl expired at claim admission'
+                    WHERE wake_id = ? AND state IN ('pending', 'delivered')
                     """,
                     (wake_id,),
                 )
-                failure = "session lease expired; delayed wake defeated"
+                failure = "wake ttl expired; delayed wake defeated"
+            session_row: sqlite3.Row | None = None
+            if failure is None:
+                session_row = conn.execute(
+                    "SELECT * FROM wire_sessions WHERE session_id = ?", (session_id,)
+                ).fetchone()
+                if session_row is None:
+                    raise WireError("unknown session")
+                if session_row["seat"] != seat.name:
+                    raise WireError("session belongs to a different seat")
+                if session_row["state"] not in LIVE_SESSION_STATES:
+                    raise WireError(f"session is {session_row['state']}; cannot claim")
+                if not json.loads(session_row["capabilities"]).get("claim", True):
+                    # R3: a session that declared claim=false cannot claim work;
+                    # the declaration is honored at the boundary that matters.
+                    raise WireError(
+                        "session did not declare the claim capability; cannot claim"
+                    )
+                if not _lease_is_live(session_row["lease_expires_at"], now):
+                    # Fencing marks are recorded in THIS transaction and must
+                    # survive the refusal, so the refusal is raised after the
+                    # transaction commits (raising inside the ``with`` block
+                    # would roll the honest expiry record back).
+                    conn.execute(
+                        """
+                        UPDATE wire_wakes
+                        SET state = 'expired', last_error = 'session lease expired at claim time'
+                        WHERE wake_id = ?
+                        """,
+                        (wake_id,),
+                    )
+                    failure = "session lease expired; delayed wake defeated"
             if failure is None:
                 task_row = conn.execute(
                     "SELECT * FROM wire_tasks WHERE task_id = ?", (row["task_ref"],)

@@ -219,6 +219,28 @@ class WireClient:
         """List this seat's registered sessions with computed lease liveness."""
         return self.request({"op": "sessions"})["sessions"]
 
+    def sessions_page(
+        self,
+        *,
+        limit: int | None = None,
+        after_registered_at: str | None = None,
+        after_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One full session-listing page with truthful continuation (T2).
+
+        Returns ``{"sessions": [...], "has_more": bool, "next_after": ...}``;
+        pass ``next_after``'s fields back as ``after_registered_at`` /
+        ``after_session_id`` to walk a seat larger than one page.
+        """
+        payload: dict[str, Any] = {"op": "sessions"}
+        if limit is not None:
+            payload["limit"] = limit
+        if after_registered_at is not None:
+            payload["after_registered_at"] = after_registered_at
+        if after_session_id is not None:
+            payload["after_session_id"] = after_session_id
+        return self.request(payload)
+
     def wake(
         self,
         *,
@@ -314,3 +336,58 @@ class WireClient:
         if after_wake_id is not None:
             payload["after_wake_id"] = after_wake_id
         return self.request(payload)["wakes"]
+
+    def wake_list_page(
+        self,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+        after_created_at: str | None = None,
+        after_wake_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One full wake-listing page with truthful continuation (T2/T3).
+
+        Returns ``{"wakes": [...], "has_more": bool, "next_after": ...}``.
+        The plain :meth:`wake_list` helper is preserved for existing callers
+        and still returns just the rows of a single page.
+        """
+        payload: dict[str, Any] = {"op": "wake_list"}
+        if state is not None:
+            payload["state"] = state
+        if limit is not None:
+            payload["limit"] = limit
+        if after_created_at is not None:
+            payload["after_created_at"] = after_created_at
+        if after_wake_id is not None:
+            payload["after_wake_id"] = after_wake_id
+        return self.request(payload)
+
+    def wake_list_iter(
+        self,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+        max_pages: int = 1_000,
+    ) -> Iterator[dict[str, Any]]:
+        """Walk the ENTIRE wake backlog page by page via truthful cursors.
+
+        T2/T3 companion to :meth:`wake_list_page`: yields each full page
+        (including its continuation metadata) until ``has_more`` is false.
+        ``max_pages`` is a runaway guard, not a data bound — a healthy
+        server terminates on ``has_more=false`` long before it.
+        """
+        cursor: dict[str, str] | None = None
+        for _ in range(max_pages):
+            page = self.wake_list_page(
+                state=state,
+                limit=limit,
+                after_created_at=cursor["created_at"] if cursor else None,
+                after_wake_id=cursor["wake_id"] if cursor else None,
+            )
+            yield page
+            if not page["has_more"] or not page["next_after"]:
+                return
+            cursor = page["next_after"]
+        raise WireError(
+            f"wake_list_iter exceeded {max_pages} pages; cursor did not terminate"
+        )

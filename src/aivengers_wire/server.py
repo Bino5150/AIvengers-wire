@@ -31,6 +31,51 @@ from .wake import MAX_WAKE_LIST_LIMIT
 
 LOG = logging.getLogger("aivengers_wire")
 
+
+def _fit_listing_response(
+    response: dict[str, Any],
+    rows_key: str,
+    *,
+    cursor_field_a: str,
+    cursor_field_b: str,
+    budget: int = MAX_FRAME_BYTES,
+) -> dict[str, Any]:
+    """T3: bound a listing response by its ACTUAL serialized frame size.
+
+    Count caps alone do not bound bytes: legal maximum-length fields make a
+    full count-cap page exceed ``MAX_FRAME_BYTES``, which ordinary clients
+    refuse as unreadable (reviewer-measured: 100 wakes with 128-char task
+    refs and idempotency keys = 90,957 B; 30 sessions with 2,048-char
+    metadata = 73,602 B). Rows are dropped from the tail until the encoded
+    frame fits; every dropped row stays reachable through the truthful
+    cursor, and ``has_more`` is forced true whenever any row was dropped.
+    At least one maximum-size legal row always fits — admission caps bound
+    a single row far below the frame budget (task_ref/idempotency_key
+    <= 128 chars, session meta <= 2,048 chars) — so a page that cannot fit
+    even one row is a contract violation and fails loudly rather than
+    lying. The measurement is the exact transport encoding (JSON, UTF-8,
+    newline-terminated frame) including the response envelope and cursor
+    metadata.
+    """
+    rows = response[rows_key]
+    while rows and len(encode_frame(response)) > budget:
+        rows.pop()
+        response["has_more"] = True
+    if not rows:
+        raise WireError(
+            "listing response cannot fit the transport frame budget; "
+            "this indicates an admission-cap contract violation"
+        )
+    if response["has_more"]:
+        last = rows[-1]
+        response["next_after"] = {
+            cursor_field_a: last[cursor_field_a],
+            cursor_field_b: last[cursor_field_b],
+        }
+    else:
+        response["next_after"] = None
+    return response
+
 #: Watch subscriptions are bounded: a listener whose socket stops draining
 #: gets dropped once its pending outbound bytes pass this limit. The drop is
 #: announced with an ``overflow`` event when possible, then the connection is
@@ -374,12 +419,45 @@ class WireServer:
             )
             return {"session": session}
         if op == "sessions":
-            require_exact_keys(request, required={"op"}, optional={"limit"})
+            require_exact_keys(
+                request,
+                required={"op"},
+                optional={"limit", "after_registered_at", "after_session_id"},
+            )
             limit = request.get("limit", MAX_WAKE_LIST_LIMIT)
-            return {
-                "sessions": self.store.list_sessions(seat=seat.name, limit=limit),
-                "has_more": False,
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ProtocolError("limit must be a positive integer")
+            if limit > MAX_WAKE_LIST_LIMIT:
+                raise ProtocolError(f"limit must not exceed {MAX_WAKE_LIST_LIMIT}")
+            if (request.get("after_registered_at") is None) != (
+                request.get("after_session_id") is None
+            ):
+                raise ProtocolError(
+                    "after_registered_at and after_session_id must be given together"
+                )
+            # T2: fetch one sentinel row beyond the public cap so has-more
+            # is truthful at the cap (the old handler hardcoded False and
+            # offered no continuation at all).
+            rows = self.store.list_sessions(
+                seat=seat.name,
+                limit=limit,
+                after_registered_at=request.get("after_registered_at"),
+                after_session_id=request.get("after_session_id"),
+                include_sentinel=True,
+            )
+            has_more = len(rows) > limit
+            response = {
+                "sessions": rows[:limit],
+                "has_more": has_more,
             }
+            # T3: bound the response by its actual serialized frame size;
+            # dropped rows stay reachable through the truthful cursor.
+            return _fit_listing_response(
+                response,
+                "sessions",
+                cursor_field_a="registered_at",
+                cursor_field_b="session_id",
+            )
         if op == "wake":
             require_exact_keys(
                 request,
@@ -462,31 +540,38 @@ class WireServer:
                 raise ProtocolError(
                     f"limit must not exceed {MAX_WAKE_LIST_LIMIT}"
                 )
-            # Fetch one extra row for honest has-more detection; the store
-            # caps at MAX_WAKE_LIST_LIMIT, so at the cap the flag is
-            # conservative (may report more when exactly `limit` remain).
-            fetch = min(limit + 1, MAX_WAKE_LIST_LIMIT)
+            # T2: the sentinel row is fetched BEYOND the public cap. The old
+            # ``fetch = min(limit + 1, MAX_WAKE_LIST_LIMIT)`` capped the
+            # fetch AT the cap, so a default/max page could never see the
+            # sentinel and reported ``has_more=false`` with the rest of the
+            # queue unread — false completeness, not conservative reporting.
+            if (request.get("after_created_at") is None) != (
+                request.get("after_wake_id") is None
+            ):
+                raise ProtocolError(
+                    "after_created_at and after_wake_id must be given together"
+                )
             rows = self.store.list_wakes(
                 seat=seat.name,
                 state=state,
-                limit=fetch,
+                limit=limit,
                 after_created_at=request.get("after_created_at"),
                 after_wake_id=request.get("after_wake_id"),
+                include_sentinel=True,
             )
             has_more = len(rows) > limit
-            page = rows[:limit]
-            next_after = None
-            if has_more and page:
-                last = page[-1]
-                next_after = {
-                    "created_at": last["created_at"],
-                    "wake_id": last["wake_id"],
-                }
-            return {
-                "wakes": page,
+            response = {
+                "wakes": rows[:limit],
                 "has_more": has_more,
-                "next_after": next_after,
             }
+            # T3: bound the response by its actual serialized frame size;
+            # dropped rows stay reachable through the truthful cursor.
+            return _fit_listing_response(
+                response,
+                "wakes",
+                cursor_field_a="created_at",
+                cursor_field_b="wake_id",
+            )
         raise ProtocolError(f"unsupported operation: {op!r}")
 
     # ── watch: authenticated real-time notification subscription ──────────
