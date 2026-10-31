@@ -40,40 +40,61 @@ def _fit_listing_response(
     cursor_field_b: str,
     budget: int = MAX_FRAME_BYTES,
 ) -> dict[str, Any]:
-    """T3: bound a listing response by its ACTUAL serialized frame size.
+    """Bound a listing response by its ACTUAL FINAL transport size.
 
-    Count caps alone do not bound bytes: legal maximum-length fields make a
-    full count-cap page exceed ``MAX_FRAME_BYTES``, which ordinary clients
-    refuse as unreadable (reviewer-measured: 100 wakes with 128-char task
-    refs and idempotency keys = 90,957 B; 30 sessions with 2,048-char
-    metadata = 73,602 B). Rows are dropped from the tail until the encoded
-    frame fits; every dropped row stays reachable through the truthful
-    cursor, and ``has_more`` is forced true whenever any row was dropped.
-    At least one maximum-size legal row always fits — admission caps bound
-    a single row far below the frame budget (task_ref/idempotency_key
-    <= 128 chars, session meta <= 2,048 chars) — so a page that cannot fit
-    even one row is a contract violation and fails loudly rather than
-    lying. The measurement is the exact transport encoding (JSON, UTF-8,
-    newline-terminated frame) including the response envelope and cursor
-    metadata.
+    R3 bounded listings by serialized bytes; the reviewer's R3-B probe
+    showed the measurement still ran BEFORE two fields that ship on the
+    wire: the continuation cursor (``next_after``) and the server's
+    ``ok`` envelope. A page measuring 65,530B bare actually measured
+    65,558B complete and was refused by ordinary clients. R4 fix: the
+    cursor is set BEFORE any measurement, every measurement is taken on
+    the COMPLETE transport frame ``{"ok": true, **response}`` — the exact
+    bytes a client reads — and the cursor is recomputed after every trim.
+
+    R3-A fix: a legitimately EMPTY listing (fresh empty queue, filtered
+    query, or a cursor exactly past the last record) is a successful,
+    correctly shaped page — empty items, ``has_more=false``, no
+    continuation cursor. Only a NON-EMPTY page trimmed down to nothing
+    (a single legal row exceeding the frame budget — unreachable given
+    admission caps: max wake row ≈ 0.9 KB, max session row ≈ 13 KB,
+    both far below the 65,536-byte budget) is a contract violation and
+    fails loudly rather than lying.
+
+    Lossless pagination holds: dropped rows stay reachable through the
+    truthful cursor, ``has_more`` is forced true whenever anything was
+    dropped, and the cursor always names the last INCLUDED row, so a
+    consumer walking pages can never loop forever (the cursor advances
+    or ``has_more`` goes false).
     """
     rows = response[rows_key]
-    while rows and len(encode_frame(response)) > budget:
+    started_empty = not rows
+
+    def _refresh_cursor() -> None:
+        if response["has_more"] and rows:
+            last = rows[-1]
+            response["next_after"] = {
+                cursor_field_a: last[cursor_field_a],
+                cursor_field_b: last[cursor_field_b],
+            }
+        else:
+            response["next_after"] = None
+
+    def _wire_bytes() -> int:
+        # The COMPLETE final transport frame, envelope included — what an
+        # ordinary client actually reads and bounds-checks.
+        return len(encode_frame({"ok": True, **response}))
+
+    # Cursor metadata exists BEFORE the first size measurement (R3-B).
+    _refresh_cursor()
+    while rows and _wire_bytes() > budget:
         rows.pop()
         response["has_more"] = True
-    if not rows:
+        _refresh_cursor()
+    if not rows and not started_empty:
         raise WireError(
             "listing response cannot fit the transport frame budget; "
             "this indicates an admission-cap contract violation"
         )
-    if response["has_more"]:
-        last = rows[-1]
-        response["next_after"] = {
-            cursor_field_a: last[cursor_field_a],
-            cursor_field_b: last[cursor_field_b],
-        }
-    else:
-        response["next_after"] = None
     return response
 
 #: Watch subscriptions are bounded: a listener whose socket stops draining
