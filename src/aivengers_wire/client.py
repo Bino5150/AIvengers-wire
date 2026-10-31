@@ -68,6 +68,7 @@ class WireClient:
         channels: list[str] | None = None,
         timeout_ms: int | None = None,
         idle_timeout_seconds: float | None = None,
+        session_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Subscribe to persisted-message notifications and yield event frames.
 
@@ -95,6 +96,14 @@ class WireClient:
         client-side socket timeout used while waiting for frames; it defaults
         to generous headroom over the server timeout so server-side expiry is
         what you actually observe.
+
+        W0 wake: ``session_id`` optionally binds this subscription to one
+        registered session owned by this seat. A session-targeted wake is
+        delivered only to the watcher bound to that session; a seat-level
+        wake is delivered only to unbound watchers. Bound watchers also
+        receive their seat's queued wake intents immediately after the
+        ``subscribed`` ack (catch-up), as ``wake`` event frames. Wake events
+        never advance cursors.
         """
         if channels is not None:
             if not channels:
@@ -107,6 +116,10 @@ class WireClient:
             if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
                 raise WireError("timeout_ms must be a positive integer")
             payload["timeout_ms"] = timeout_ms
+        if session_id is not None:
+            if not isinstance(session_id, str) or not session_id:
+                raise WireError("session_id must be a non-empty string when present")
+            payload["session_id"] = session_id
         token = load_token(self.token_path)
         if idle_timeout_seconds is None:
             idle_timeout_seconds = 30.0 + (timeout_ms / 1000.0 if timeout_ms else 0.0)
@@ -154,3 +167,227 @@ class WireClient:
             raise
         finally:
             sock.close()
+
+    # ── wake: session registry + wake pipeline (W0) ──────────────────────
+    # All wake operations use the same one-shot authenticated ``request``
+    # pattern as every other relay operation: connect, auth, one request
+    # frame, one response, close. No persistent connection is held.
+
+    def register_session(
+        self,
+        *,
+        adapter: str,
+        capabilities: dict[str, bool] | None = None,
+        model_claim: str | None = None,
+        lease_seconds: int | None = None,
+        platform_pid: int | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Register a runtime session owned by this seat.
+
+        The relay generates the ``session_id``; the caller never supplies its
+        own identity. ``model_claim`` is recorded verbatim with evidence
+        ``unverified`` — a Wire token authenticates a seat, never a model.
+        """
+        payload: dict[str, Any] = {"op": "register", "adapter": adapter}
+        if capabilities is not None:
+            payload["capabilities"] = capabilities
+        if model_claim is not None:
+            payload["model_claim"] = model_claim
+        if lease_seconds is not None:
+            payload["lease_seconds"] = lease_seconds
+        if platform_pid is not None:
+            payload["platform_pid"] = platform_pid
+        if meta is not None:
+            payload["meta"] = meta
+        return self.request(payload)["session"]
+
+    def heartbeat_session(
+        self, *, session_id: str, state: str | None = None
+    ) -> dict[str, Any]:
+        """Renew the session's lease and optionally update its live state."""
+        payload: dict[str, Any] = {"op": "heartbeat", "session_id": session_id}
+        if state is not None:
+            payload["state"] = state
+        return self.request(payload)["session"]
+
+    def unregister_session(self, *, session_id: str) -> dict[str, Any]:
+        """Mark a session offline; its lease and live state end immediately."""
+        return self.request({"op": "unregister", "session_id": session_id})["session"]
+
+    def sessions(self) -> list[dict[str, Any]]:
+        """List this seat's registered sessions with computed lease liveness."""
+        return self.request({"op": "sessions"})["sessions"]
+
+    def sessions_page(
+        self,
+        *,
+        limit: int | None = None,
+        after_registered_at: str | None = None,
+        after_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One full session-listing page with truthful continuation (T2).
+
+        Returns ``{"sessions": [...], "has_more": bool, "next_after": ...}``;
+        pass ``next_after``'s fields back as ``after_registered_at`` /
+        ``after_session_id`` to walk a seat larger than one page.
+        """
+        payload: dict[str, Any] = {"op": "sessions"}
+        if limit is not None:
+            payload["limit"] = limit
+        if after_registered_at is not None:
+            payload["after_registered_at"] = after_registered_at
+        if after_session_id is not None:
+            payload["after_session_id"] = after_session_id
+        return self.request(payload)
+
+    def wake(
+        self,
+        *,
+        target_seat: str,
+        task_ref: str,
+        target_session_id: str | None = None,
+        idempotency_key: str | None = None,
+        priority: int | None = None,
+        ttl_seconds: int | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Request a durable wake intent for an existing task grant.
+
+        Returns the relay's honest receipt: ``resolution`` is one of
+        ``delivered``, ``queued``, ``queued_offline``, ``ambiguous``,
+        ``unsupported`` or ``duplicate`` (idempotent retry), plus the wake
+        record and, for ``ambiguous``, the candidate session ids. A wake
+        references an existing open task; it can never create one.
+        """
+        payload: dict[str, Any] = {
+            "op": "wake",
+            "target_seat": target_seat,
+            "task_ref": task_ref,
+        }
+        if target_session_id is not None:
+            payload["target_session_id"] = target_session_id
+        if idempotency_key is not None:
+            payload["idempotency_key"] = idempotency_key
+        if priority is not None:
+            payload["priority"] = priority
+        if ttl_seconds is not None:
+            payload["ttl_seconds"] = ttl_seconds
+        if note is not None:
+            payload["note"] = note
+        return self.request(payload)
+
+    def wake_ack(self, *, wake_id: str, session_id: str) -> dict[str, Any]:
+        """Acknowledge a wake intent as an adapter. NOT a resume proof."""
+        response = self.request(
+            {"op": "wake_ack", "wake_id": wake_id, "session_id": session_id}
+        )
+        return response["wake"]
+
+    def claim(self, *, wake_id: str, session_id: str) -> dict[str, Any]:
+        """Atomically claim the wake's task for one session (exactly once)."""
+        return self.request(
+            {"op": "claim", "wake_id": wake_id, "session_id": session_id}
+        )
+
+    def complete(
+        self,
+        *,
+        task_ref: str,
+        session_id: str,
+        outcome: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a truthful completion or failure receipt for a claimed task."""
+        payload: dict[str, Any] = {
+            "op": "complete",
+            "task_ref": task_ref,
+            "session_id": session_id,
+            "outcome": outcome,
+        }
+        if note is not None:
+            payload["note"] = note
+        return self.request(payload)
+
+    def wake_status(self, *, wake_id: str) -> dict[str, Any]:
+        """Fetch one wake's exact pipeline position (target/requester only)."""
+        return self.request({"op": "wake_status", "wake_id": wake_id})["wake"]
+
+    def wake_list(
+        self,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+        after_created_at: str | None = None,
+        after_wake_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List wakes addressed to or requested by this seat (catch-up path).
+
+        R8: keyset-paginated and bounded; pass ``after_*`` values from the
+        server's ``next_after`` to walk a backlog beyond one page.
+        """
+        payload: dict[str, Any] = {"op": "wake_list"}
+        if state is not None:
+            payload["state"] = state
+        if limit is not None:
+            payload["limit"] = limit
+        if after_created_at is not None:
+            payload["after_created_at"] = after_created_at
+        if after_wake_id is not None:
+            payload["after_wake_id"] = after_wake_id
+        return self.request(payload)["wakes"]
+
+    def wake_list_page(
+        self,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+        after_created_at: str | None = None,
+        after_wake_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One full wake-listing page with truthful continuation (T2/T3).
+
+        Returns ``{"wakes": [...], "has_more": bool, "next_after": ...}``.
+        The plain :meth:`wake_list` helper is preserved for existing callers
+        and still returns just the rows of a single page.
+        """
+        payload: dict[str, Any] = {"op": "wake_list"}
+        if state is not None:
+            payload["state"] = state
+        if limit is not None:
+            payload["limit"] = limit
+        if after_created_at is not None:
+            payload["after_created_at"] = after_created_at
+        if after_wake_id is not None:
+            payload["after_wake_id"] = after_wake_id
+        return self.request(payload)
+
+    def wake_list_iter(
+        self,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+        max_pages: int = 1_000,
+    ) -> Iterator[dict[str, Any]]:
+        """Walk the ENTIRE wake backlog page by page via truthful cursors.
+
+        T2/T3 companion to :meth:`wake_list_page`: yields each full page
+        (including its continuation metadata) until ``has_more`` is false.
+        ``max_pages`` is a runaway guard, not a data bound — a healthy
+        server terminates on ``has_more=false`` long before it.
+        """
+        cursor: dict[str, str] | None = None
+        for _ in range(max_pages):
+            page = self.wake_list_page(
+                state=state,
+                limit=limit,
+                after_created_at=cursor["created_at"] if cursor else None,
+                after_wake_id=cursor["wake_id"] if cursor else None,
+            )
+            yield page
+            if not page["has_more"] or not page["next_after"]:
+                return
+            cursor = page["next_after"]
+        raise WireError(
+            f"wake_list_iter exceeded {max_pages} pages; cursor did not terminate"
+        )

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .errors import AuthenticationError, WireError
+from .wake import WakeStoreMixin
 
 SCHEMA_VERSION = 1
 
@@ -40,7 +41,15 @@ class Seat:
     can_forward: bool
 
 
-class WireStore:
+class WireStore(WakeStoreMixin):
+    """SQLite storage and seat credential management.
+
+    W0 note: session/wake/task storage arrives via :class:`WakeStoreMixin`
+    (see ``wake.py``). The wake tables are additive (``CREATE TABLE IF NOT
+    EXISTS``) and ``SCHEMA_VERSION`` stays at 1 so a daemon rollback to
+    pre-wake code keeps working against the same database.
+    """
+
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
         self.db_path = state_dir / "wire.db"
@@ -104,6 +113,8 @@ class WireStore:
                 );
                 """
             )
+            # W0 wake foundation: additive tables, ignored by older code.
+            self.initialize_wake_tables(conn)
             existing = conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
