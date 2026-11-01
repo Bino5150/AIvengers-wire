@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "wire": {
+      "command": "${AIVENGERS_WIRE_PYTHON:-python3}",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/wire_mcp.py"],
+      "env": {
+        "AIVENGERS_WIRE_SEAT": "${AIVENGERS_WIRE_SEAT:-}",
+        "AIVENGERS_WIRE_STATE_DIR": "${AIVENGERS_WIRE_STATE_DIR:-}",
+        "AIVENGERS_WIRE_TOKEN_FILE": "${AIVENGERS_WIRE_TOKEN_FILE:-}"
+      }
+    }
+  }
+}
