@@ -48,9 +48,9 @@ TOOL_NAMES = {"whoami", "channels", "read", "get_message", "advance", "post", "r
 class McpProcess:
     """One adapter process, spoken to over newline-delimited JSON-RPC."""
 
-    def __init__(self, env: dict[str, str]):
+    def __init__(self, env: dict[str, str], python_flags: tuple[str, ...] = ()):
         self.proc = subprocess.Popen(
-            [sys.executable, str(SERVER)],
+            [sys.executable, *python_flags, str(SERVER)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -271,7 +271,8 @@ class ProtocolSurfaceTests(AdapterTestCase):
         self.assertEqual(caught.exception.payload["kind"], "not_configured")
         env = self.env("alice")
         env["PYTHONPATH"] = str(self.root / "empty")
-        uninstalled = McpProcess(env)
+        # -S hides site-packages too, so this holds when Wire is pip-installed.
+        uninstalled = McpProcess(env, ("-S",))
         self.adapters.append(uninstalled)
         uninstalled.initialize()
         with self.assertRaises(ToolFailed) as caught:
