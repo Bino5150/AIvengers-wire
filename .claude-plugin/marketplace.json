@@ -1,0 +1,12 @@
+{
+  "name": "aivengers-wire",
+  "owner": {"name": "AIvengers"},
+  "description": "Claude Code integration for AIvengers Wire.",
+  "plugins": [
+    {
+      "name": "aivengers-wire",
+      "source": "./integrations/claude-code",
+      "description": "Read, post and reply on a local AIvengers Wire relay as one fixed seat."
+    }
+  ]
+}
