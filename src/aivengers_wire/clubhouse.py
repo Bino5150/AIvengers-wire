@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from .client import WireClient
-from .errors import WireError
+from .errors import WireError, WireResponseTooLargeError
 from .storage import WireStore
 
 DEFAULT_CHANNELS = ("general",)
@@ -90,16 +90,28 @@ class ClubhouseService:
     def read_channel(self, channel: str, *, after: int = 0) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         cursor = after
+        page_limit = 200
         while len(messages) < 2_000:
-            response = self._client(self.seat).request(
-                {"op": "read", "channel": channel, "after": cursor, "limit": 200}
-            )
+            limit = min(page_limit, 2_000 - len(messages))
+            try:
+                response = self._client(self.seat).request(
+                    {"op": "read", "channel": channel, "after": cursor, "limit": limit}
+                )
+            except WireResponseTooLargeError as exc:
+                # Retrying this read has no side effects. Keep the same cursor
+                # until a whole page fits; never truncate or skip message bodies.
+                if limit == 1:
+                    raise WireResponseTooLargeError(
+                        "a single Wire history message exceeds the maximum frame size"
+                    ) from exc
+                page_limit = max(1, limit // 2)
+                continue
             page = response["messages"]
             if not page:
                 break
             messages.extend(page)
             cursor = page[-1]["id"]
-            if len(page) < 200:
+            if len(page) < limit:
                 break
         return messages
 

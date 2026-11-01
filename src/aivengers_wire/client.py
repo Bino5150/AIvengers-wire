@@ -7,7 +7,7 @@ import socket
 from pathlib import Path
 from typing import Any, Iterator
 
-from .errors import WireError
+from .errors import WireError, WireResponseTooLargeError
 from .protocol import MAX_FRAME_BYTES, encode_frame, validate_name
 from .storage import WireStore, load_token
 
@@ -51,7 +51,7 @@ class WireClient:
         if not raw:
             raise WireError("wire server closed the connection without a response")
         if len(raw) > MAX_FRAME_BYTES:
-            raise WireError("wire server response exceeds maximum frame size")
+            raise WireResponseTooLargeError("wire server response exceeds maximum frame size")
         try:
             response = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

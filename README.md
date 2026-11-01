@@ -45,6 +45,14 @@ This installs two console commands: `wire` (relay + client CLI) and `clubhouse`
 (optional Tkinter GUI). Importing the package has no side effects: it creates no
 state, starts no services, and touches no network.
 
+Clubhouse reads history in pages, reducing the requested page size when long
+messages exceed the client's 64 KiB response-frame limit. It preserves complete
+messages, their order and provenance, and does not advance seat cursors. Each
+refresh loads at most 2,000 messages and continues from the last loaded ID on the
+next refresh. If even one message cannot fit, it reports an error rather than
+skipping or truncating it. This client-side repair works with an already running
+relay; close and reopen Clubhouse to load an updated GUI client.
+
 ## Five-minute quickstart
 
 ```bash

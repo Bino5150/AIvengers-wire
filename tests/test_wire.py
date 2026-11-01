@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import signal
 import socket
@@ -23,8 +24,8 @@ from aivengers_wire.clubhouse import (
     DEFAULT_CHANNELS,
     build_identity_routes,
 )
-from aivengers_wire.errors import WireError
-from aivengers_wire.protocol import encode_frame
+from aivengers_wire.errors import WireError, WireResponseTooLargeError
+from aivengers_wire.protocol import MAX_FRAME_BYTES, encode_frame
 from aivengers_wire.server import WireServer
 from aivengers_wire.storage import WireStore
 
@@ -327,6 +328,35 @@ class RunningWireTestCase(unittest.TestCase):
             else:
                 root.destroy()
 
+    def test_clubhouse_reads_oversized_history_losslessly_without_advancing_cursor(self) -> None:
+        expected = []
+        for index in range(213):
+            if index % 17 == 0:
+                self.client("tech").request(
+                    {"op": "post", "channel": "other", "body": "not this channel"}
+                )
+            payload = {
+                "op": "post", "channel": "general",
+                "body": f"{index}: " + "🧰" * 270 + 'a\\\"\n' * 200,
+            }
+            seat = "tech"
+            if index % 19 == 0:
+                seat = "bino-gateway"
+                payload["forwarded_for"] = "sol"
+            posted = self.client(seat).request(payload)["message"]
+            expected.append({key: value for key, value in posted.items() if key != "duplicate"})
+        with self.assertRaisesRegex(WireError, "response exceeds maximum frame size"):
+            self.client("bino").request(
+                {"op": "read", "channel": "general", "after": 0, "limit": 200}
+            )
+        service = ClubhouseService(self.store, seat="bino")
+        self.assertEqual(service.read_channel("general"), expected)
+        self.assertEqual(service.read_channel("general", after=expected[99]["id"]), expected[100:])
+        self.assertEqual(
+            self.client("bino").request({"op": "cursor", "channel": "general"})["last_message_id"],
+            0,
+        )
+
     @unittest.skipUnless(os.environ.get("DISPLAY"), "requires a graphical display")
     def test_idle_refresh_does_not_rebuild_message_widgets(self) -> None:
         root = tk.Tk()
@@ -342,6 +372,95 @@ class RunningWireTestCase(unittest.TestCase):
                 app.close()
             else:
                 root.destroy()
+
+    @unittest.skipUnless(os.environ.get("DISPLAY"), "requires a graphical display")
+    def test_clubhouse_window_displays_history_larger_than_one_frame(self) -> None:
+        ids = [self.client("tech").request(
+            {"op": "post", "channel": "general", "body": f"{index}: " + "x" * 10_000}
+        )["message"]["id"] for index in range(8)]
+        root = tk.Tk()
+        root.withdraw()
+        app = None
+        try:
+            app = ClubhouseApp(root, ClubhouseService(self.store, seat="bino"), refresh_ms=10_000)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                root.update()
+                if len(app.messages["general"]) == len(ids):
+                    break
+                time.sleep(0.01)
+            self.assertEqual([message["id"] for message in app.messages["general"]], ids)
+            self.assertEqual(app.connection_label.cget("text"), "● connected")
+            self.assertEqual(len(app.message_frame.winfo_children()), len(ids))
+        finally:
+            if app is not None:
+                app.close()
+            else:
+                root.destroy()
+
+
+class HistoryPagingSafetyTestCase(unittest.TestCase):
+    def test_client_preserves_exact_frame_boundary_and_typed_overflow(self) -> None:
+        payload = {"ok": True, "padding": ""}
+        payload["padding"] = "x" * (MAX_FRAME_BYTES - len(encode_frame(payload)))
+        raw = encode_frame(payload)
+        self.assertEqual(len(raw), MAX_FRAME_BYTES)
+        self.assertEqual(WireClient._read(io.BytesIO(raw)), payload)
+        payload["padding"] += "x"
+        with self.assertRaises(WireResponseTooLargeError):
+            WireClient._read(io.BytesIO(encode_frame(payload)))
+
+    def test_single_oversized_message_fails_instead_of_skipping_or_looping(self) -> None:
+        service = ClubhouseService(mock.Mock(), seat="bino")
+        client = mock.Mock()
+        client.request.side_effect = WireResponseTooLargeError("oversized")
+        with mock.patch.object(service, "_client", return_value=client):
+            with self.assertRaisesRegex(WireResponseTooLargeError, "a single Wire history message"):
+                service.read_channel("general", after=11)
+        requests = [call.args[0] for call in client.request.call_args_list]
+        self.assertEqual([request["limit"] for request in requests], [200, 100, 50, 25, 12, 6, 3, 1])
+        self.assertTrue(all(request["after"] == 11 for request in requests))
+
+    def test_unrelated_errors_are_not_retried_even_with_the_same_text(self) -> None:
+        for message in ("invalid seat credentials", "connection timed out",
+                        "wire server response exceeds maximum frame size"):
+            with self.subTest(message=message):
+                service = ClubhouseService(mock.Mock(), seat="bino")
+                client = mock.Mock()
+                error = WireError(message)
+                client.request.side_effect = error
+                with mock.patch.object(service, "_client", return_value=client):
+                    with self.assertRaises(WireError) as raised:
+                        service.read_channel("general")
+                self.assertIs(raised.exception, error)
+                client.request.assert_called_once()
+
+    def test_reduced_pages_obey_batch_bound_and_resume_at_last_canonical_id(self) -> None:
+        rows = [{"id": index * 3} for index in range(1, 2056)]
+        service = ClubhouseService(mock.Mock(), seat="bino")
+        client = mock.Mock()
+
+        def read(request):
+            self.assertEqual(request["op"], "read")
+            self.assertEqual(request["channel"], "general")
+            if request["limit"] > 12:
+                raise WireResponseTooLargeError("oversized")
+            return {"messages": [row for row in rows if row["id"] > request["after"]][:request["limit"]]}
+
+        client.request.side_effect = read
+        with mock.patch.object(service, "_client", return_value=client):
+            first = service.read_channel("general")
+            self.assertEqual(len(first), 2000)
+            second = service.read_channel("general", after=first[-1]["id"])
+        self.assertEqual(first + second, rows)
+
+    def test_empty_history_is_one_successful_read(self) -> None:
+        service = ClubhouseService(mock.Mock(), seat="bino")
+        client = mock.Mock()
+        client.request.return_value = {"messages": []}
+        with mock.patch.object(service, "_client", return_value=client):
+            self.assertEqual(service.read_channel("general"), [])
+        client.request.assert_called_once()
 
 
 class StandaloneSafetyTestCase(unittest.TestCase):
