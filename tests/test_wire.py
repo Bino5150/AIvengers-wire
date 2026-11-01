@@ -391,7 +391,7 @@ class RunningWireTestCase(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual([message["id"] for message in app.messages["general"]], ids)
             self.assertEqual(app.connection_label.cget("text"), "● connected")
-            self.assertEqual(len(app.message_frame.winfo_children()), len(ids))
+            self.assertEqual(len(app.history_text.winfo_children()), len(ids))
         finally:
             if app is not None:
                 app.close()

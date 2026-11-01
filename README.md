@@ -53,6 +53,12 @@ next refresh. If even one message cannot fit, it reports an error rather than
 skipping or truncating it. This client-side repair works with an already running
 relay; close and reopen Clubhouse to load an updated GUI client.
 
+History uses a read-only native scrolling text area, so long histories and tall
+individual messages remain reachable without overlapping native message frames.
+The mouse wheel and trackpad scroll over history and Reply buttons; the composer
+and channel list keep their own scrolling. New messages follow the bottom when
+you are already there and preserve your reading position when you scroll back.
+
 ## Five-minute quickstart
 
 ```bash

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -170,6 +171,8 @@ class ClubhouseApp:
         self.refresh_after_id: str | None = None
         self.current_channel = "general"
         self.reply_to: int | None = None
+        self._wheel_remainder = 0.0
+        self._windowing_system = self.root.tk.call("tk", "windowingsystem")
         self.messages: dict[str, list[dict[str, Any]]] = {
             channel: [] for channel in DEFAULT_CHANNELS
         }
@@ -294,23 +297,44 @@ class ClubhouseApp:
 
         history_shell = tk.Frame(main, bg=self.BG)
         history_shell.pack(fill="both", expand=True, padx=(18, 12))
-        self.canvas = tk.Canvas(
+        # Text keeps document coordinates separate from native child-window
+        # geometry. A canvas containing one frame for the entire history can
+        # overflow native coordinates and overlap distant posts on X11.
+        self.history_text = tk.Text(
             history_shell,
+            width=1,
+            height=1,
+            wrap="word",
+            state="disabled",
             bg=self.BG,
+            fg=self.TEXT,
+            selectbackground=self.ACCENT,
+            font=("Sans", 10),
+            cursor="arrow",
+            padx=12,
+            pady=10,
             borderwidth=0,
             highlightthickness=0,
         )
-        scrollbar = ttk.Scrollbar(history_shell, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar = ttk.Scrollbar(history_shell, orient="vertical", command=self.history_text.yview)
+        self.history_text.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.message_frame = tk.Frame(self.canvas, bg=self.BG)
-        self.message_window = self.canvas.create_window(
-            (0, 0), window=self.message_frame, anchor="nw"
-        )
-        self.message_frame.bind("<Configure>", self._sync_scroll_region)
-        self.canvas.bind("<Configure>", self._sync_message_width)
-        self.canvas.bind_all("<MouseWheel>", self._mousewheel)
+        self.history_text.pack(side="left", fill="both", expand=True)
+        self.history_text.tag_configure("message", background=self.CARD,
+                                        lmargin1=14, lmargin2=14, rmargin=14)
+        self.history_text.tag_configure("reply_message", background=self.CARD_REPLY,
+                                        lmargin1=42, lmargin2=42)
+        self.history_text.tag_configure("header", foreground=self.ACCENT,
+                                        font=("Sans", 10, "bold"), spacing1=10, spacing3=4)
+        self.history_text.tag_configure("body", spacing1=0, spacing3=0)
+        self.history_text.tag_configure("metadata", foreground=self.MUTED,
+                                        font=("Monospace", 8), spacing1=8, spacing3=10)
+        self.history_text.tag_configure("forwarded", foreground=self.ORANGE)
+        self.history_text.tag_configure("empty", foreground=self.MUTED,
+                                        justify="center", spacing1=60)
+        self.history_text.bind("<Configure>", self._sync_history_width)
+        self._bind_history_scroll(self.history_text)
+        self._bind_history_scroll(scrollbar)
 
         composer = tk.Frame(main, bg=self.PANEL, highlightbackground=self.BORDER, highlightthickness=1)
         composer.pack(fill="x", padx=24, pady=(12, 22))
@@ -397,14 +421,29 @@ class ClubhouseApp:
         self._render_messages()
         self.refresh(immediate=True)
 
-    def _sync_scroll_region(self, _event: tk.Event[Any]) -> None:
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+    def _sync_history_width(self, event: tk.Event[Any]) -> None:
+        self.history_text.configure(tabs=(max(140, event.width - 56), "right"))
+        self.history_text.count("1.0", "end", "update", "ypixels")
 
-    def _sync_message_width(self, event: tk.Event[Any]) -> None:
-        self.canvas.itemconfigure(self.message_window, width=event.width)
+    def _bind_history_scroll(self, widget: tk.Widget) -> None:
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, self._mousewheel)
 
-    def _mousewheel(self, event: tk.Event[Any]) -> None:
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    def _mousewheel(self, event: tk.Event[Any]) -> str | None:
+        if getattr(event, "state", 0) & 1:  # Leave Shift-wheel to native horizontal scrolling.
+            return None
+        number = getattr(event, "num", None)
+        if number in (4, 5):
+            distance = -50 if number == 4 else 50
+        else:
+            delta = getattr(event, "delta", 0)
+            distance = -delta if self._windowing_system == "aqua" else -delta / 3
+        self._wheel_remainder += distance
+        pixels = math.trunc(self._wheel_remainder)
+        if pixels:
+            self._wheel_remainder -= pixels
+            self.history_text.yview_scroll(pixels, "pixels")
+        return "break"
 
     def _schedule_refresh(self) -> None:
         if self.closed:
@@ -437,13 +476,14 @@ class ClubhouseApp:
         result: tuple[list[str], list[dict[str, Any]]],
     ) -> None:
         channels, incoming = result
+        follow_end = not self.messages.get(channel) or self.history_text.yview()[1] >= 1.0
         if channels != self.channel_names:
             self.channel_names = channels
             self._replace_channels(channels)
         if incoming:
             self.messages.setdefault(channel, []).extend(incoming)
         if channel == self.current_channel and incoming:
-            self._render_messages(scroll_to_end=True)
+            self._render_messages(scroll_to_end=follow_end)
         self.connection_label.configure(text="● connected", fg=self.GREEN)
         self.status_label.configure(
             text=f"{len(self.messages.get(self.current_channel, []))} messages · auto-refresh on"
@@ -489,90 +529,60 @@ class ClubhouseApp:
             self._schedule_refresh()
 
     def _render_messages(self, *, scroll_to_end: bool = False) -> None:
-        for child in self.message_frame.winfo_children():
+        top_index = self.history_text.index("@0,0")
+        self.history_text.configure(state="normal")
+        for child in self.history_text.winfo_children():
             child.destroy()
+        self.history_text.delete("1.0", "end")
+        for mark in self.history_text.mark_names():
+            if mark.startswith("message_"):
+                self.history_text.mark_unset(mark)
         messages = self.messages.get(self.current_channel, [])
         if not messages:
-            tk.Label(
-                self.message_frame,
-                text="Nobody has said anything here yet. Suspicious.",
-                bg=self.BG,
-                fg=self.MUTED,
-                font=("Sans", 11),
-            ).pack(pady=80)
-            return
-        for message in messages:
-            self._render_message(message)
-        self.message_frame.update_idletasks()
+            self.history_text.insert("end", "Nobody has said anything here yet. Suspicious.", "empty")
+        else:
+            for message in messages:
+                self._render_message(message)
+        self.history_text.configure(state="disabled")
+        self.history_text.update_idletasks()
+        # Resolve off-screen wrapped-line and embedded-button heights before
+        # positioning the viewport; lazy estimates otherwise move the thumb.
+        self.history_text.count("1.0", "end", "update", "ypixels")
         if scroll_to_end:
-            self.canvas.yview_moveto(1.0)
+            self.history_text.yview_moveto(1.0)
+        else:
+            self.history_text.yview(top_index)
 
     def _render_message(self, message: dict[str, Any]) -> None:
         is_reply = message["reply_to"] is not None
-        outer = tk.Frame(self.message_frame, bg=self.BG)
-        outer.pack(fill="x", padx=(42 if is_reply else 4, 16), pady=6)
-        card = tk.Frame(
-            outer,
-            bg=self.CARD_REPLY if is_reply else self.CARD,
-            highlightbackground=self.BORDER,
-            highlightthickness=1,
-        )
-        card.pack(fill="x")
-        header = tk.Frame(card, bg=card["bg"])
-        header.pack(fill="x", padx=14, pady=(10, 3))
-        sender = str(message["sender"]).upper()
-        tk.Label(
-            header,
-            text=sender,
-            bg=card["bg"],
-            fg=self.ACCENT,
-            font=("Sans", 10, "bold"),
-        ).pack(side="left")
-        tk.Label(
-            header,
-            text=f"  #{message['id']}",
-            bg=card["bg"],
-            fg=self.MUTED,
-            font=("Sans", 9),
-        ).pack(side="left")
+        mark = f"message_{message['id']}"
+        self.history_text.mark_set(mark, "end-1c")
+        self.history_text.mark_gravity(mark, "left")
+        header = f"{str(message['sender']).upper()}  #{message['id']}"
         if is_reply:
-            tk.Label(
-                header,
-                text=f"↳ reply to #{message['reply_to']}",
-                bg=card["bg"],
-                fg=self.MUTED,
-                font=("Sans", 9),
-            ).pack(side="left", padx=(10, 0))
-        ttk.Button(
-            header,
+            header += f"  ↳ reply to #{message['reply_to']}"
+        self.history_text.insert("end", header + "\t", "header")
+        reply = ttk.Button(
+            self.history_text,
             text="Reply",
             style="Clubhouse.TButton",
             command=lambda item=message: self._set_reply(item),
-        ).pack(side="right")
-        tk.Label(
-            card,
-            text=message["body"],
-            bg=card["bg"],
-            fg=self.TEXT,
-            justify="left",
-            anchor="w",
-            wraplength=780,
-            font=("Sans", 10),
-        ).pack(fill="x", padx=14, pady=(4, 8))
+        )
+        self._bind_history_scroll(reply)
+        self.history_text.window_create("end", window=reply, align="center", pady=4)
+        self.history_text.insert("end", "\n", "header")
+        self.history_text.insert("end", message["body"] + "\n", "body")
         metadata = (
             f"{message['created_at']}  ·  {message['transport_actor']}  ·  "
             f"{message['provenance']}  ·  authority={message['authority']}  ·  "
             f"owner={str(message['owner']).lower()}"
         )
-        tk.Label(
-            card,
-            text=metadata,
-            bg=card["bg"],
-            fg=self.ORANGE if message["provenance"] == "forwarded" else self.MUTED,
-            justify="left",
-            anchor="w",
-            font=("Monospace", 8),
-        ).pack(fill="x", padx=14, pady=(0, 10))
+        tags = ("metadata", "forwarded") if message["provenance"] == "forwarded" else ("metadata",)
+        self.history_text.insert("end", metadata + "\n", tags)
+        self.history_text.tag_add("message", mark, "end-1c")
+        if is_reply:
+            self.history_text.tag_add("reply_message", mark, "end-1c")
+        self.history_text.insert("end", "\n")
 
     def _set_reply(self, message: dict[str, Any]) -> None:
         self.reply_to = int(message["id"])
