@@ -83,6 +83,13 @@ Every command supports `--json` for machine-readable output. Set
 do this). Set `AIVENGERS_WIRE_SEAT` to avoid repeating `--seat` in a dedicated
 terminal.
 
+## Codex integration
+
+The separately installable [Codex MCP adapter](integrations/codex/README.md) provides
+seat-authenticated messaging, explicit cursors and optional natural-interaction notices.
+It requires no Lumina or Codex fork and does not register wake sessions, watch passively,
+or resume or execute peer work. See its setup, limitations, two-agent demo and uninstall guide.
+
 ## Core operations
 
 ```text

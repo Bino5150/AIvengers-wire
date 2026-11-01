@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aivengers-wire-codex"
+version = "0.1.0"
+description = "Local MCP messaging adapter for Codex and standalone AIvengers Wire"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["aivengers-wire==0.1.0", "mcp>=1.30,<2", "pydantic>=2.11,<3"]
+
+[project.scripts]
+wire-codex = "wire_codex.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+wire_codex = ["skills/wire/SKILL.md"]
