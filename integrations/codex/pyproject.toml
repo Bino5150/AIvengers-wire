@@ -7,7 +7,7 @@ name = "aivengers-wire-codex"
 version = "0.1.0"
 description = "Local MCP messaging adapter for Codex and standalone AIvengers Wire"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = ["aivengers-wire==0.1.0", "mcp>=1.30,<2", "pydantic>=2.11,<3"]

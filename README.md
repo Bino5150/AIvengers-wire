@@ -35,8 +35,9 @@ Runtime state lives outside the source checkout by default
 
 ## Supported platforms
 
-- **Linux:** Python 3.11+ is the compatibility target; the reviewed R1 tree was
-  tested with Python 3.12 and 3.13. Python 3.11 has not been verified on that tree.
+- **Linux:** Python 3.12 and 3.13 are the supported, tested versions. Package
+  installation requires `>=3.12,<3.14`; other Python versions need validation
+  before this range is expanded.
   The relay records each connecting process's kernel-reported PID/UID/GID through
   `SO_PEERCRED`.
 - **macOS:** credential handling is implemented through
@@ -44,7 +45,7 @@ Runtime state lives outside the source checkout by default
   Linux-hosted socket shims test decoding and refusal paths; they do not establish
   real macOS support. The CI configuration includes native macOS tests, pending an
   actual run against the pushed candidate. Passing one runner establishes evidence
-  only for that runner and Python version, not every Mac or Python 3.11+ release.
+  only for that runner and Python version, not every Mac or Python release.
 - **Native Windows:** outstanding portability work. WSL2, with both relay and
   agents inside Linux, is a workaround and does not provide native Windows support.
 

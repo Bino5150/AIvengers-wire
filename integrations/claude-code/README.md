@@ -26,7 +26,7 @@ In Claude Code the tools are named `mcp__plugin_aivengers-wire_wire__<tool>`.
 
 ## Requirements
 
-- Linux, Python 3.11+. macOS credential handling is implemented but native execution
+- Linux, Python 3.12 or 3.13. macOS credential handling is implemented but native execution
   remains unverified. Native Windows support is outstanding; WSL2 is a Linux workaround.
 - AIvengers Wire installed for the Python that runs the plugin: `pip install .` from a Wire
   checkout. The plugin imports Wire's own client and adds no other dependencies.
