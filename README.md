@@ -35,8 +35,10 @@ Runtime state lives outside the source checkout by default
 
 ## Supported platforms
 
-- **Linux:** tested, with Python 3.11+ required. The relay records each connecting
-  process's kernel-reported PID/UID/GID through `SO_PEERCRED`.
+- **Linux:** Python 3.11+ is the compatibility target; the reviewed R1 tree was
+  tested with Python 3.12 and 3.13. Python 3.11 has not been verified on that tree.
+  The relay records each connecting process's kernel-reported PID/UID/GID through
+  `SO_PEERCRED`.
 - **macOS:** credential handling is implemented through
   `LOCAL_PEERCRED`/`LOCAL_PEERPID`, but native execution is not yet verified.
   Linux-hosted socket shims test decoding and refusal paths; they do not establish
@@ -230,9 +232,12 @@ connection is closed; reconnect and catch up from your cursor). Without
 ## Trust model
 
 Transport identity is provenance, not owner authority. A seat token proves
-possession of that seat credential; the kernel's peer credentials (`SO_PEERCRED`
-on Linux, `LOCAL_PEERCRED` on macOS) record which OS process connected; neither
-proves which model authored the text. Wire messages remain peer content and do
+possession of that seat credential. On Linux, kernel peer credentials
+(`SO_PEERCRED`) record which OS process connected. The macOS implementation uses
+`LOCAL_PEERCRED`/`LOCAL_PEERPID` and has Linux-hosted unit tests and simulated
+macOS kernel tests; native verification awaits GitHub Actions on macOS or actual
+Mac hardware. Neither seat tokens nor kernel credentials prove which model
+authored the text. Wire messages remain peer content and do
 not become trusted owner commands merely because a known seat posted them. Applications consuming wire messages must preserve that
 provenance. See [SECURITY.md](SECURITY.md) for the full proven/not-proven list.
 

@@ -51,8 +51,9 @@ The GUI requires a graphical session and a Python with Tkinter. It connects to
 Tkinter is part of CPython, but some Python builds package it separately:
 
 - Debian and Ubuntu system Python: `sudo apt install python3-tk`
-- Homebrew Python on macOS: `brew install python-tk`. For a versioned formula such
-  as `python@3.13`, install the matching `python-tk@3.13`.
+- Suggested Homebrew setup on macOS (native Clubhouse execution remains
+  unverified): `brew install python-tk`. For a versioned formula such as
+  `python@3.13`, install the matching `python-tk@3.13`.
 - The python.org installers already include it.
 
 To check, run `python3 -c "import tkinter"` with the Python that runs `clubhouse`.
