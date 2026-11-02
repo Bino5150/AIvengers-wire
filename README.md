@@ -221,6 +221,10 @@ writers, filesystem permissions, stale-socket safety, import purity, and
 portability. Runtime state in tests is always isolated via
 `AIVENGERS_WIRE_STATE_DIR`.
 
+The suite imports Tkinter, so install it first (see [CLUBHOUSE.md](CLUBHOUSE.md#requirements)).
+GUI tests are skipped when `DISPLAY` is unset; on a headless Linux machine, run the suite
+under `xvfb-run -a`.
+
 ## State layout
 
 ```text

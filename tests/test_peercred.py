@@ -27,7 +27,7 @@ SUPPORTED = sys.platform.startswith("linux") or sys.platform == "darwin"
 
 def _xucred(*, version: int = 0, uid: int = 501, groups: tuple[int, ...] = (20, 12, 61)) -> bytes:
     padded = list(groups) + [0] * (16 - len(groups))
-    return struct.pack("@IIh16I", version, uid, len(groups), *padded)
+    return struct.pack("=IIh2x16I", version, uid, len(groups), *padded)
 
 
 class FakeSocket:
@@ -85,17 +85,29 @@ class DarwinBranchTestCase(unittest.TestCase):
         with self.assertRaisesRegex(WireError, "xucred version"):
             peer_credentials(sock, platform="darwin")
 
-    def test_empty_group_list_is_refused(self) -> None:
-        sock = FakeSocket({(0, 0x001): _xucred(groups=()), (0, 0x002): struct.pack("@i", 1)})
-        with self.assertRaisesRegex(WireError, "no groups"):
-            peer_credentials(sock, platform="darwin")
+    def test_group_count_outside_one_to_sixteen_is_refused(self) -> None:
+        empty = FakeSocket({(0, 0x001): _xucred(groups=()), (0, 0x002): struct.pack("@i", 1)})
+        with self.assertRaisesRegex(WireError, "reports 0 groups"):
+            peer_credentials(empty, platform="darwin")
+        too_many = struct.pack("=IIh2x16I", 0, 501, 17, *([20] * 16))
+        overfull = FakeSocket({(0, 0x001): too_many, (0, 0x002): struct.pack("@i", 1)})
+        with self.assertRaisesRegex(WireError, "reports 17 groups"):
+            peer_credentials(overfull, platform="darwin")
+        self.assertEqual(overfull.calls, [(0, 0x001, 76)], "no pid lookup after a refused xucred")
 
-    def test_short_replies_are_refused(self) -> None:
+    def test_xucred_layout_matches_the_c_struct(self) -> None:
+        self.assertEqual(peercred._DARWIN_XUCRED.size, 76)
+        self.assertEqual(peercred._DARWIN_PID.size, 4)
+
+    def test_replies_of_the_wrong_size_are_refused(self) -> None:
         short_cred = FakeSocket({(0, 0x001): b"\0" * 8, (0, 0x002): struct.pack("@i", 1)})
-        with self.assertRaisesRegex(WireError, "short LOCAL_PEERCRED"):
+        with self.assertRaisesRegex(WireError, "LOCAL_PEERCRED returned 8 bytes, expected 76"):
             peer_credentials(short_cred, platform="darwin")
+        long_cred = FakeSocket({(0, 0x001): _xucred() + b"\0", (0, 0x002): struct.pack("@i", 1)})
+        with self.assertRaisesRegex(WireError, "returned 77 bytes"):
+            peer_credentials(long_cred, platform="darwin")
         short_pid = FakeSocket({(0, 0x001): _xucred(), (0, 0x002): b"\0"})
-        with self.assertRaisesRegex(WireError, "short LOCAL_PEERPID"):
+        with self.assertRaisesRegex(WireError, "LOCAL_PEERPID returned 1 bytes, expected 4"):
             peer_credentials(short_pid, platform="darwin")
 
     def test_kernel_errors_become_wire_errors(self) -> None:
@@ -121,7 +133,7 @@ class LinuxBranchTestCase(unittest.TestCase):
     def test_short_reply_is_refused(self) -> None:
         fake_socket_module = types.SimpleNamespace(SOL_SOCKET=1, SO_PEERCRED=17)
         with mock.patch.object(peercred, "socket", fake_socket_module):
-            with self.assertRaisesRegex(WireError, "short SO_PEERCRED"):
+            with self.assertRaisesRegex(WireError, "SO_PEERCRED returned 4 bytes, expected 12"):
                 peer_credentials(FakeSocket({(1, 17): b"\0" * 4}), platform="linux")
 
 
