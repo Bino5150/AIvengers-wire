@@ -63,7 +63,17 @@ class WireClient:
 
     @staticmethod
     def _write(stream: Any, payload: dict[str, Any]) -> None:
-        stream.write(encode_frame(payload))
+        # An unbuffered socket file's write() is a single send(), which may
+        # take only part of the frame when the kernel send buffer is small
+        # (macOS gives Unix sockets 8 KiB). Keep writing until the whole
+        # frame is out; otherwise the relay waits forever for the rest of
+        # the line and the request times out.
+        frame = memoryview(encode_frame(payload))
+        while frame:
+            sent = stream.write(frame)
+            if sent is None:
+                raise socket.timeout("timed out writing to the wire server")
+            frame = frame[sent:]
 
     @staticmethod
     def _read(stream: Any) -> dict[str, Any]:

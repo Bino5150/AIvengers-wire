@@ -432,8 +432,62 @@ class RunningWireTestCase(RelayFixture):
                 root.destroy()
 
 
+class _PartialWriteStream:
+    """Accepts at most ``chunk`` bytes per write(), like send() on a full buffer."""
+
+    def __init__(self, chunk: int, *, stall_after: int | None = None):
+        self.chunk = chunk
+        self.stall_after = stall_after
+        self.data = bytearray()
+        self.calls = 0
+
+    def write(self, data: bytes | memoryview) -> int | None:
+        self.calls += 1
+        if self.stall_after is not None and self.calls > self.stall_after:
+            return None  # what SocketIO.write returns when the socket would block
+        taken = bytes(data[: self.chunk])
+        self.data.extend(taken)
+        return len(taken)
+
+
+class ClientFrameWriteTests(unittest.TestCase):
+    """A request frame reaches the relay whole even when each send is partial."""
+
+    def test_partial_writes_are_continued_until_the_frame_is_complete(self) -> None:
+        payload = {"op": "post", "channel": "general", "body": "a" * 32_768}
+        stream = _PartialWriteStream(chunk=8_192)
+        WireClient._write(stream, payload)
+        self.assertEqual(bytes(stream.data), encode_frame(payload))
+        self.assertGreater(stream.calls, 1)
+
+    def test_a_stalled_write_is_a_timeout_not_a_silently_truncated_frame(self) -> None:
+        stream = _PartialWriteStream(chunk=1_024, stall_after=2)
+        with self.assertRaises(socket.timeout):
+            WireClient._write(stream, {"op": "post", "channel": "general", "body": "b" * 5_000})
+
+
 class BoundedResponseTests(RelayFixture):
     """Post echoes and read pages fit the response bound; CLI retries are safe."""
+
+    def test_largest_body_posts_through_a_macos_sized_send_buffer(self) -> None:
+        # Regression (macOS CI): with an 8 KiB socket send buffer, the macOS
+        # default for Unix sockets, one write() sent only part of a large
+        # request frame, and the post timed out waiting for the relay.
+        self.store.add_seat("alice")
+        real_socket = socket.socket
+
+        class SmallSendBuffer(real_socket):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)
+                self.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8_192)
+
+        body = "a" * 32_768
+        with mock.patch("aivengers_wire.client.socket.socket", SmallSendBuffer):
+            posted = self.client("alice").request(
+                {"op": "post", "channel": "general", "body": body}
+            )["message"]
+        self.assertEqual(posted["body"], body)
+        self.assertEqual([m["body"] for m in self.stored("general")], [body])
 
     def test_cli_post_with_response_over_64_kib_succeeds_and_retries_safely(self) -> None:
         # Repro: this body fits the 64 KiB request frame, but the echoed
