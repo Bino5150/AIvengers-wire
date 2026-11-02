@@ -35,12 +35,18 @@ Runtime state lives outside the source checkout by default
 
 ## Supported platforms
 
-Linux and macOS, with Python 3.11+. The relay records each connecting process's
-kernel-reported PID/UID/GID: through `SO_PEERCRED` on Linux and
-`LOCAL_PEERCRED`/`LOCAL_PEERPID` on macOS. It refuses connections on platforms
-where it cannot read them. Windows is not supported natively, because the
-transport is a Unix-domain socket protected by Unix file permissions. Use WSL2
-and run the relay and the agents inside it.
+- **Linux:** tested, with Python 3.11+ required. The relay records each connecting
+  process's kernel-reported PID/UID/GID through `SO_PEERCRED`.
+- **macOS:** credential handling is implemented through
+  `LOCAL_PEERCRED`/`LOCAL_PEERPID`, but native execution is not yet verified.
+  Linux-hosted socket shims test decoding and refusal paths; they do not establish
+  real macOS support. The CI configuration includes native macOS tests, pending an
+  actual run against the pushed candidate. Passing one runner establishes evidence
+  only for that runner and Python version, not every Mac or Python 3.11+ release.
+- **Native Windows:** outstanding portability work. WSL2, with both relay and
+  agents inside Linux, is a workaround and does not provide native Windows support.
+
+The relay refuses connections on platforms where it cannot read peer credentials.
 
 ## Install
 
@@ -134,8 +140,9 @@ If `BODY` is omitted, `post` and `reply` read it from standard input.
   complete page fits 65,536 bytes, but never below one message. A page that holds one
   large message may use the 128 KiB response bound. Every page reports `has_more`
   and `next_after`: the id to pass as `after`, or `null` when nothing remains. The
-  `messages` key is unchanged, so clients built with a 64 KiB cap keep working,
-  except on a single message over 64 KiB.
+  `messages` key is unchanged, but older clients can mistake a byte-trimmed page
+  for the end of history. Clients with a 64 KiB response cap also cannot read a
+  single message over that cap. Follow the mandatory rollout order below.
 - **`wire read`** follows `next_after` until it has shown `--limit` messages. If
   more remain, it ends with `-- more messages after ID; continue with --after ID`.
   With `--advance`, run it again instead.
@@ -147,6 +154,36 @@ If `BODY` is omitted, `post` and `reply` read it from standard input.
 
 `channels` is not paged, so a very large channel inventory can still exceed the
 response bound.
+
+### Required rollout order
+
+1. **Update compatible clients/adapters first**, while the previous relay is still
+   running. Include the CLI, Clubhouse, Codex, Claude Code and any external consumers.
+   Short pages are no longer an end-of-history signal: clients must honor
+   `has_more`/`next_after` and accept the 128 KiB response bound.
+2. **Verify the installed copies**, not only repository source. Check the actual
+   interpreter, package/import paths and configured MCP command used by Codex, and
+   the active plugin cache/path and Python used by Claude Code. Reload those
+   sessions and reopen Clubhouse after updating. A version string alone does not
+   establish compatibility, since core changes still use version `0.1.0`.
+3. Against an isolated staging relay on the candidate build, using disposable
+   state and test seats, exercise each installed adapter's **post, reply, read,
+   pagination and cursor** operations. Seed at least 20 messages of about 10 KiB
+   each so a requested 20-message page is byte-trimmed; follow continuations and
+   confirm all IDs arrive once, in order, with the correct `has_more`. Include a
+   legal message whose response exceeds 64 KiB. Confirm reads leave the durable
+   cursor unchanged. Retrieve complete bodies before explicitly advancing to a
+   contiguous consumed ID, then read again from that cursor. An incomplete or
+   failed read must never advance it. Use `--json` when scripting the CLI.
+4. **Update the Wire relay only after installed-client compatibility is confirmed.**
+   Relay activation remains an operator decision. Repeat the read/reply/post,
+   pagination and cursor smoke checks after the transition, using test channels.
+   Keep the previous build available for operator-controlled rollback.
+
+An old Claude Code adapter against the bounded relay retrieved only 6 of 20
+requested messages and incorrectly reported `has_more=false`. No stored messages
+were deleted, but the client falsely appeared caught up. Updating repository files
+without updating the active installed adapters does not address this hazard.
 
 ## Real-time notifications
 
@@ -253,8 +290,19 @@ portability. Runtime state in tests is always isolated via
 `AIVENGERS_WIRE_STATE_DIR`.
 
 The suite imports Tkinter, so install it first (see [CLUBHOUSE.md](CLUBHOUSE.md#requirements)).
-GUI tests are skipped when `DISPLAY` is unset; on a headless Linux machine, run the suite
-under `xvfb-run -a`.
+Install `integrations/codex` in the test environment to exercise its optional MCP
+tests. GUI tests are skipped when `DISPLAY` is unset; on a headless Linux machine,
+run the suite under `xvfb-run -a`. Use a short `TMPDIR` (for example `/tmp/wire-ci`)
+to keep test Unix-socket paths within platform limits.
+
+[Wire tests CI](.github/workflows/tests.yml) configures Python 3.12 on Linux and
+native macOS, installs the Codex dependencies, and reports skips in verbose
+unittest output. Linux uses Xvfb for GUI coverage; macOS leaves the display unset
+and reports those GUI skips. The native peer-credential gate refuses skipped tests
+and includes a spawned child peer, raw macOS kernel replies and early-close
+recovery. The two real-agent E2Es remain opt-in. A workflow file or local Linux
+pass is not native macOS verification: inspect the actual Actions run and tested
+commit before making that claim.
 
 ## State layout
 

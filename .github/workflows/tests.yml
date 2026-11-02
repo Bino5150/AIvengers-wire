@@ -1,0 +1,80 @@
+name: Wire tests
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python 3.12 / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes python3-tk xvfb xauth
+      - name: Install packages and lint tool
+        run: |
+          python -m pip install . ./integrations/codex 'ruff==0.17.3'
+          python -c 'import tkinter, mcp, wire_codex, aivengers_wire'
+      - name: Isolate runtime state with short socket paths
+        run: |
+          scratch=$(mktemp -d /tmp/wci.XXXXXX)
+          mkdir -p "$scratch/home" "$scratch/state" "$scratch/tmp"
+          {
+            echo "HOME=$scratch/home"
+            echo "XDG_STATE_HOME=$scratch/state"
+            echo "AIVENGERS_WIRE_STATE_DIR=$scratch/state/wire"
+            echo "TMPDIR=$scratch/tmp"
+            echo "PYTHONPATH=$GITHUB_WORKSPACE/src:$GITHUB_WORKSPACE/tests"
+          } >> "$GITHUB_ENV"
+      - name: Lightweight correctness lint
+        # Deliberately excludes historical style and unused-import cleanup.
+        run: python -m ruff check --select E9,F63,F7,F82 src tests integrations
+      - name: Native peer credentials (no skips allowed)
+        run: |
+          git rev-parse HEAD 'HEAD^{tree}'
+          python - <<'PY'
+          import platform
+          import sys
+          import unittest
+
+          print(platform.platform(), sys.version, flush=True)
+          if sys.platform not in ('linux', 'darwin'):
+              raise SystemExit('Expected a native Linux or macOS runner')
+          suite = unittest.TestLoader().loadTestsFromNames([
+              'test_peercred.RealSocketTestCase',
+              'test_peercred.InProcessRelayTestCase',
+          ])
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if result.testsRun < 5 or result.skipped or not result.wasSuccessful():
+              raise SystemExit('Native peer-credential gate failed or skipped coverage')
+          PY
+      - name: Full Wire suite (Linux with GUI)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m unittest discover -s tests -v
+      - name: Full Wire suite (macOS; GUI skips reported)
+        if: runner.os == 'macOS'
+        run: |
+          unset DISPLAY
+          python -m unittest discover -s tests -v

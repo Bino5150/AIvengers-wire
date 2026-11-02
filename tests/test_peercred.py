@@ -12,6 +12,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -52,6 +53,58 @@ class FakeSocket:
 
 @unittest.skipUnless(SUPPORTED, "peer credentials are only supported on Linux and macOS")
 class RealSocketTestCase(unittest.TestCase):
+    def test_kernel_reports_spawned_child_and_raw_darwin_credentials(self) -> None:
+        # Keep the child connected until credentials have been read. A same-
+        # process test cannot detect an implementation returning its own PID.
+        child_code = """
+import json, os, socket, sys
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    sock.connect(sys.argv[1])
+    print(json.dumps([os.getpid(), os.geteuid(), os.getegid()]), flush=True)
+    sys.stdin.read(1)
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                path = str(Path(temp) / "child.sock")
+                listener.bind(path)
+                listener.listen(1)
+                listener.settimeout(5)
+                child = subprocess.Popen(
+                    [sys.executable, "-c", child_code, path],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    accepted, _ = listener.accept()
+                    with accepted:
+                        creds = peer_credentials(accepted)
+                        self.assertEqual(creds.pid, child.pid)
+                        self.assertNotEqual(creds.pid, os.getpid())
+                        if sys.platform == "darwin":
+                            # Independent raw kernel checks, without the
+                            # implementation's constants or decoder helpers.
+                            raw = accepted.getsockopt(0, 0x001, 76)
+                            self.assertEqual(len(raw), 76)
+                            version, uid, ngroups, *groups = struct.unpack("=IIh2x16I", raw)
+                            self.assertEqual(version, 0)
+                            self.assertTrue(1 <= ngroups <= 16)
+                            self.assertEqual(uid, os.geteuid())
+                            self.assertEqual(groups[0], os.getegid())
+                            raw_pid = accepted.getsockopt(0, 0x002, 4)
+                            self.assertEqual(len(raw_pid), 4)
+                            self.assertEqual(struct.unpack("=i", raw_pid)[0], child.pid)
+                finally:
+                    try:
+                        stdout, stderr = child.communicate(input="x", timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.communicate()
+                        raise
+                self.assertEqual(child.returncode, 0, stderr)
+                self.assertEqual([creds.pid, creds.uid, creds.gid], json.loads(stdout))
+
     def test_kernel_reports_this_process_through_a_listening_socket(self) -> None:
         # A real bind/listen/connect/accept, the way the relay receives clients
         # (socketpair is not used: platforms differ on whether it records creds).
@@ -206,6 +259,18 @@ class InProcessRelayTestCase(unittest.TestCase):
             posted["peer"],
             {"pid": os.getpid(), "uid": os.geteuid(), "gid": os.getegid()},
         )
+
+    @unittest.skipUnless(SUPPORTED, "peer credentials are only supported on Linux and macOS")
+    def test_early_close_does_not_break_the_next_authenticated_client(self) -> None:
+        # LOCAL_PEERPID may fail after a peer closes. Either credential outcome
+        # must leave the relay available to the next authenticated connection.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(str(self.store.socket_path))
+        self.assertTrue(self.client.request({"op": "ping"})["ok"])
+        posted = self.client.request(
+            {"op": "post", "channel": "general", "body": "after early close"}
+        )["message"]
+        self.assertEqual(posted["peer"]["pid"], os.getpid())
 
     def test_refusal_reaches_the_client_on_unsupported_platforms(self) -> None:
         # The relay reads credentials on accept, before any frame. The test

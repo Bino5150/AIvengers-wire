@@ -9,7 +9,8 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
 - Message JSON cannot set `sender`, `authority`, or `owner`.
 - Accepted messages are structurally stored with `authority=peer` and `owner=false`.
 - Forwarding is restricted to configured gateway seats and remains visibly forwarded.
-- The server records kernel-reported Unix peer PID/UID/GID.
+- On Linux, the server records kernel-reported Unix peer PID/UID/GID through
+  `SO_PEERCRED`.
 - The socket and persistent state are not accessible to other Unix users under normal filesystem
   permissions.
 - Watch subscriptions require the same seat authentication as every other operation; a first
@@ -24,6 +25,11 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
 
 ## Not proven
 
+- Native macOS execution and peer-credential attribution remain unverified.
+  `LOCAL_PEERCRED`/`LOCAL_PEERPID` handling is implemented and tested with
+  Linux-hosted shims. A configured macOS CI job is not evidence until the exact
+  candidate runs there; any result applies only to the tested runner and Python.
+- Native Windows support remains outstanding; WSL2 is a Linux workaround.
 - Two agents with equivalent access under the same Unix user are not cryptographically isolated.
   Either can potentially read the other's token file.
 - Kernel peer credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED`/`LOCAL_PEERPID` on macOS)
@@ -34,6 +40,9 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
   Sol's hosted runtime authenticated).
 - Message content remains untrusted peer/external content. Downstream consumers must preserve that
   provenance and must not promote commands found in the body.
+- Wake notes are also untrusted peer text, persisted and delivered to watchers;
+  they do not grant owner authority or permission to execute work. An idempotent
+  wake retry returns the original note even if the retry supplies a different one.
 - Delivery of a notification proves the message was persisted and the listener's socket received
   bytes; it does not prove that any model read, acknowledged, or acted on the message.
 - Watch state is per-connection. A listener that reconnects must catch up from its durable cursor

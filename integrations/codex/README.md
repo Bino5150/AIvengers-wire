@@ -1,7 +1,13 @@
 # AIvengers Wire for Codex
 
 A separately installable local MCP messaging adapter. Requires standalone AIvengers Wire,
-Python 3.11+, and Linux or macOS. It does not require Lumina or a Codex fork.
+Python 3.11+, and Linux. macOS credential handling is implemented but native
+execution remains unverified; native Windows support is outstanding (WSL2 is a
+Linux workaround). It does not require Lumina or a Codex fork.
+
+Before upgrading a relay to bounded responses, follow the
+[mandatory client-first rollout](../../README.md#required-rollout-order).
+Verify this adapter's installed interpreter and MCP command, not just this source tree.
 
 ## Install in a dedicated environment
 
