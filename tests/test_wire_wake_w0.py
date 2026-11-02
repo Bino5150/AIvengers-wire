@@ -33,6 +33,7 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -1463,6 +1464,142 @@ class GoblinReviewRegressions(RunningWireTestCase):
                 wake_id=w["wake_id"], session_id=s["session_id"]
             )
         self.assertEqual(self.store.get_task("T")["state"], "open")
+
+
+class WakeReplayFlowControlTests(unittest.TestCase):
+    """Catch-up replay is paced by the watcher's own drain.
+
+    A full catch-up batch of maximal-note wakes is ≈ 430 KB, more than
+    SUBSCRIBER_BUFFER_LIMIT. Written as one burst, a small kernel send buffer
+    (macOS: 8 KiB for Unix stream sockets) used to overflow and drop a
+    healthy watcher after ~22 of 32 wakes, on every reconnect.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.store = WireStore(Path(self.temp_dir.name) / "state")
+        self.store.initialize()
+        self.store.add_seat("alice")
+        self.store.add_seat("bob")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @contextmanager
+    def in_process_relay(self, *, sndbuf: int):
+        """Run a real WireServer whose accepted sockets get ``SO_SNDBUF``."""
+        original = WireServer._peer_credentials
+
+        def small_send_buffer(writer):
+            writer.get_extra_info("socket").setsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf
+            )
+            return original(writer)
+
+        server = WireServer(self.store)
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def run() -> None:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(server.start())
+            ready.set()
+            loop.run_forever()
+
+        with unittest.mock.patch.object(
+            WireServer, "_peer_credentials", staticmethod(small_send_buffer)
+        ):
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            self.assertTrue(ready.wait(5), "in-process relay did not start")
+            try:
+                yield server
+            finally:
+                asyncio.run_coroutine_threadsafe(server.close(), loop).result(5)
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(5)
+                loop.close()
+
+    def test_full_batch_of_maximal_notes_replays_without_overflow(self) -> None:
+        self.store.add_task(task_id="t1", title="probe")
+        bob = WireClient(self.store, seat="bob")
+        batch = wake_module.PENDING_REPLAY_BATCH
+        with self.in_process_relay(sndbuf=8192):
+            sid = bob.register_session(adapter="probe")["session_id"]
+            for i in range(batch):
+                self.store.request_wake(
+                    requester=Seat("alice", False),
+                    target_seat="bob",
+                    task_ref="t1",
+                    target_session_id=sid,
+                    note="\x01" * wake_module.MAX_NOTE_CHARS,
+                    idempotency_key=f"k{i}",
+                )
+            events = []
+            for frame in bob.watch(session_id=sid, timeout_ms=10_000):
+                events.append(frame)
+                if sum(e["event"] == "wake" for e in events) == batch:
+                    break
+        kinds = [frame["event"] for frame in events]
+        self.assertNotIn("overflow", kinds)
+        self.assertEqual(kinds, ["subscribed"] + ["wake"] * batch)
+        self.assertTrue(
+            all(len(f["wake"]["note"]) == wake_module.MAX_NOTE_CHARS for f in events[1:])
+        )
+
+    def test_replay_rechecks_state_after_each_drain(self) -> None:
+        """While replay waits on drain, a wake cancelled meanwhile is skipped
+        (not replayed as stale ``pending``), and a watch that ended stops the
+        replay with the rest still pending and unattempted."""
+        sid = self.store.register_session(
+            seat=Seat("bob", False), adapter="fake"
+        )["session_id"]
+        for task in ("D0", "D1", "D2", "D3"):
+            self.store.add_task(task_id=task, title="queued")
+            self.store.request_wake(
+                requester=Seat("alice", False),
+                target_seat="bob",
+                task_ref=task,
+                target_session_id=sid,
+            )
+        server = WireServer(self.store)
+        store = self.store
+
+        class Transport:
+            def get_write_buffer_size(self):
+                return 0
+
+        class Writer:
+            transport = Transport()
+
+            def __init__(self):
+                self.frames = []
+                self.drains = 0
+
+            def write(self, data):
+                self.frames.append(json.loads(data))
+
+            async def drain(self):
+                self.drains += 1
+                if self.drains == 1:
+                    store.cancel_task(task_id="D1", reason="cancelled mid-replay")
+                elif self.drains == 2:
+                    server._unsubscribe(self)  # e.g. the watch timed out
+
+            def close(self):  # pragma: no cover - not expected here
+                raise AssertionError("watcher must not be dropped")
+
+        writer = Writer()
+        server._subscribers[writer] = _Subscription(
+            channels=None, seat="bob", session_id=sid
+        )
+        asyncio.run(server._deliver_pending_wakes(Seat("bob", False), writer))
+        self.assertEqual([f["wake"]["task_ref"] for f in writer.frames], ["D0", "D2"])
+        wakes = {w["task_ref"]: w for w in self.store.list_wakes(seat="bob")}
+        self.assertEqual(wakes["D1"]["state"], "cancelled")
+        self.assertEqual(wakes["D1"]["attempts"], 0)
+        self.assertEqual((wakes["D3"]["state"], wakes["D3"]["attempts"]), ("pending", 0))
+        self.assertEqual((wakes["D2"]["state"], wakes["D2"]["attempts"]), ("pending", 1))
 
 
 class WakeNoteMigrationTests(unittest.TestCase):

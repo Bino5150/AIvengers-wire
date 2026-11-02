@@ -819,6 +819,21 @@ class WireServer:
         stays pending until its adapter acks, so an overflow or disconnect
         here loses nothing: unwritten wakes remain pending and replay on the
         next subscription. Marking must never outrun writing.
+
+        Flow control: wakes can carry a ``note`` of up to
+        :data:`~aivengers_wire.wake.MAX_NOTE_CHARS` characters (≈ 13.5 KB per
+        frame), so a full batch is ≈ 430 KB — more than
+        SUBSCRIBER_BUFFER_LIMIT. Written as one synchronous burst, a socket
+        with a small kernel send buffer (macOS defaults to 8 KiB for Unix
+        stream sockets) overflowed and dropped a healthy watcher mid-replay,
+        every reconnect. Each accepted write is therefore followed by this
+        connection's own ``drain()``: replay advances at the watcher's read
+        pace, only this watcher's handler waits, and the buffer-limit drop
+        stays as the backstop for live fanout. Because the drain yields to
+        the loop, each later wake is re-checked first — the watch may have
+        timed out or been dropped (replay stops; the rest stay pending), and
+        the wake may have been acknowledged, claimed, cancelled or expired
+        meanwhile (it is skipped instead of replayed as stale ``pending``).
         """
 
         subscription = self._subscribers.get(writer)
@@ -828,7 +843,14 @@ class WireServer:
             seat=seat.name, session_id=subscription.session_id
         )
         written = 0
-        for wake in wakes:
+        for index, wake in enumerate(wakes):
+            if index:
+                if self._subscribers.get(writer) is not subscription:
+                    break
+                current = self.store.get_wake(wake["wake_id"])
+                if current is None or current["state"] != "pending":
+                    continue
+                wake = current
             frame = encode_frame({"ok": True, "event": "wake", "wake": wake})
             transport = writer.transport
             buffered = 0 if transport is None else transport.get_write_buffer_size()
@@ -844,6 +866,10 @@ class WireServer:
             # durable state is untouched (pending until wake_ack).
             self.store.record_wake_attempt(wake["wake_id"])
             written += 1
+            try:
+                await writer.drain()
+            except (ConnectionError, RuntimeError):
+                break  # Connection gone; the rest stay pending for replay.
         if written:
             LOG.info(
                 "pending wakes transmitted seat=%r count=%d", seat.name, written
