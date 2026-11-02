@@ -11,6 +11,18 @@ from .errors import WireError, WireResponseTooLargeError
 from .protocol import MAX_FRAME_BYTES, encode_frame, validate_name
 from .storage import WireStore, load_token
 
+#: Socket failures a request or watch can hit on the way to, or while talking
+#: to, the relay. Each is reported as a ``WireError`` (with the original
+#: exception chained as ``__cause__``) instead of escaping as a traceback.
+TRANSPORT_ERRORS: tuple[type[OSError], ...] = (
+    FileNotFoundError,
+    PermissionError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    BrokenPipeError,
+    socket.timeout,
+)
+
 
 class WireClient:
     def __init__(self, store: WireStore, *, seat: str, token_path: Path | None = None):
@@ -34,12 +46,20 @@ class WireClient:
                 if not response.get("ok"):
                     raise WireError(response.get("message", "wire operation failed"))
                 return response
-        except FileNotFoundError as exc:
-            raise WireError(f"wire server is not running at {self.store.socket_path}") from exc
-        except (ConnectionRefusedError, socket.timeout) as exc:
-            raise WireError(f"cannot reach wire server at {self.store.socket_path}: {exc}") from exc
+        except TRANSPORT_ERRORS as exc:
+            raise self._transport_error(exc) from exc
         finally:
             sock.close()
+
+    def _transport_error(self, exc: OSError) -> WireError:
+        path = self.store.socket_path
+        if isinstance(exc, FileNotFoundError):
+            return WireError(f"wire server is not running at {path}")
+        if isinstance(exc, PermissionError):
+            return WireError(f"permission denied reaching wire server at {path}: {exc}")
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            return WireError(f"lost connection to wire server at {path}: {exc}")
+        return WireError(f"cannot reach wire server at {path}: {exc}")
 
     @staticmethod
     def _write(stream: Any, payload: dict[str, Any]) -> None:
@@ -153,14 +173,8 @@ class WireClient:
                         # that documented close as normal termination; any
                         # other close still raises below.
                         terminated = True
-        except FileNotFoundError as exc:
-            raise WireError(
-                f"wire server is not running at {self.store.socket_path}"
-            ) from exc
-        except (ConnectionRefusedError, socket.timeout) as exc:
-            raise WireError(
-                f"cannot reach wire server at {self.store.socket_path}: {exc}"
-            ) from exc
+        except TRANSPORT_ERRORS as exc:
+            raise self._transport_error(exc) from exc
         except WireError:
             if terminated:
                 return

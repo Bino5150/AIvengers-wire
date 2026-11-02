@@ -233,7 +233,7 @@ class WireAdapter:
             return client.request(payload)
         except WireError as exc:
             raise self._classify(client, exc, str(exc)) from exc
-        except OSError as exc:  # a reset or broken pipe that WireClient does not wrap
+        except OSError as exc:  # any socket failure WireClient does not wrap itself
             text = f"cannot reach wire server at {self.store.socket_path}: {exc}"
             raise self._classify(client, exc, text) from exc
 

@@ -71,7 +71,10 @@ MAX_WAKE_TTL_SECONDS = 86_400
 
 #: R8: wake_list pagination bound. Worst-case serialized wake rows observed
 #: during review were ~410 bytes; 100 rows ≈ 41 KB, safely under the 65,536-
-#: byte transport frame limit including envelope overhead.
+#: byte transport frame limit including envelope overhead. A wake carrying a
+#: maximal ``note`` serializes to ≈ 13.5 KB, so a page of note-heavy rows can
+#: exceed the frame; the server trims such pages by their actual serialized
+#: size (T3, ``_fit_listing_response``) and the cursor keeps them lossless.
 MAX_WAKE_LIST_LIMIT = 100
 
 #: R2: maximum pending wakes offered to one watch subscription per catch-up
@@ -89,6 +92,15 @@ MAX_META_CHARS = 2_048
 #: recorded-but-not-live. Liveness additionally requires a valid lease.
 SESSION_STATES = ("ready", "busy", "draining", "offline", "expired", "revoked")
 LIVE_SESSION_STATES = ("ready", "busy")
+
+#: States from which a session may still report the outcome of work it
+#: already claimed. ``draining`` is included on purpose: a draining session
+#: takes no new work but is expected to finish what it holds. ``offline``,
+#: ``expired`` and ``revoked`` are retired states: ``unregister`` moves a
+#: session to ``offline`` and bumps its generation, and no operation returns
+#: a retired session to a live state, so refusing these states is what
+#: fences out a stale claimant.
+COMPLETING_SESSION_STATES = ("ready", "busy", "draining")
 
 #: Wake pipeline states, in honest order. R2 revision: ``delivered`` is the
 #: adapter-receipt state (set only by ``wake_ack``); the former separate
@@ -170,6 +182,7 @@ CREATE TABLE IF NOT EXISTS wire_wakes (
     claimed_by_session TEXT,
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     last_error TEXT,
+    note TEXT,
     UNIQUE (requested_by, idempotency_key)
 );
 
@@ -289,6 +302,7 @@ def _wake_dict(row: sqlite3.Row) -> dict[str, Any]:
         "claimed_by_session": row["claimed_by_session"],
         "attempts": row["attempts"],
         "last_error": row["last_error"],
+        "note": row["note"],
     }
 
 
@@ -345,6 +359,12 @@ class WakeStoreMixin:
                 c.execute(
                     "ALTER TABLE wire_wakes ADD COLUMN requested_target_session_id TEXT"
                 )
+            # The requester's free-text ``note`` is stored with the wake so
+            # the target sees why it was woken. Added the same guarded way
+            # for stores created before the column existed; their legacy
+            # rows read back as ``note: null``.
+            if "note" not in cols:
+                c.execute("ALTER TABLE wire_wakes ADD COLUMN note TEXT")
 
         if conn is not None:
             run(conn)
@@ -882,8 +902,8 @@ class WakeStoreMixin:
                     wake_id, target_seat, target_session_id, task_ref,
                     requested_by, idempotency_key, priority, ttl_expires_at,
                     requested_target_session_id,
-                    state, created_at, attempts, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    state, created_at, attempts, last_error, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 (
                     wake_id,
@@ -898,6 +918,7 @@ class WakeStoreMixin:
                     state,
                     _utc_now(),
                     last_error,
+                    note_text,
                 ),
             )
             row = conn.execute(
@@ -1412,6 +1433,30 @@ class WakeStoreMixin:
         outcome: str,
         note: str | None = None,
     ) -> dict[str, Any]:
+        """Record the claimant's ``completed``/``failed`` receipt for a task.
+
+        Fencing rule: only the claiming session, while it is still a current
+        incarnation, may report the outcome. Concretely the session must be
+        in a :data:`COMPLETING_SESSION_STATES` state (``ready``, ``busy`` or
+        ``draining``) and hold a live lease, checked inside the admitting
+        transaction against the post-lock clock (T1).
+
+        - A retired session (``offline`` after ``unregister``, ``expired``,
+          ``revoked``) is refused. ``unregister`` is what advances
+          ``generation``, and nothing returns a retired session to a live
+          state (``heartbeat`` refuses them; ``register`` mints a new
+          ``session_id`` at generation 1), so the state check fences every
+          stale generation that ``claim`` handed out as
+          ``fencing.session_generation``.
+        - A session whose lease lapsed while it worked is refused but can
+          recover: ``heartbeat`` renews the lease of a session that was never
+          retired, then completion proceeds. This matches the ``wake_ack``
+          rule (R4) — a receipt must come from a session that is
+          demonstrably alive.
+
+        A fencing refusal writes nothing: the task stays ``claimed`` by the
+        retired session, visible to the operator, who can ``task cancel`` it.
+        """
         if outcome not in ("completed", "failed"):
             raise WireError("outcome must be 'completed' or 'failed'")
         note_text = _validated_optional_text(note, field="note", limit=MAX_NOTE_CHARS)
@@ -1457,6 +1502,19 @@ class WakeStoreMixin:
             elif task_row["state"] != "claimed":
                 failure = f"task is {task_row['state']}; cannot complete"
             if failure is None:
+                # Fencing: a retired or lease-lapsed claimant cannot record a
+                # completion (see the docstring). Nothing has been written in
+                # this transaction yet, so raising here rolls back nothing.
+                if session_row["state"] not in COMPLETING_SESSION_STATES:
+                    raise WireError(
+                        f"session is {session_row['state']} (generation "
+                        f"{session_row['generation']}); a retired session cannot "
+                        "complete its claimed task"
+                    )
+                if not _lease_is_live(session_row["lease_expires_at"], _iso_now()):
+                    raise WireError(
+                        "session lease expired; heartbeat to renew it before completing"
+                    )
                 completed_at = _utc_now()
                 cursor = conn.execute(
                     """

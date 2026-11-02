@@ -269,7 +269,10 @@ def execute(args: argparse.Namespace) -> int:
         store.initialize()
         scope = None
         if args.scope is not None:
-            scope = json.loads(args.scope)
+            try:
+                scope = json.loads(args.scope)
+            except json.JSONDecodeError as exc:
+                raise WireError(f"--scope must be valid JSON: {exc}") from exc
             if not isinstance(scope, dict):
                 raise WireError("--scope must be a JSON object")
         task = store.add_task(
@@ -365,14 +368,6 @@ def execute(args: argparse.Namespace) -> int:
             print("\n".join(format_message(message) for message in messages))
         return 0
     if args.command == "watch":
-        client = _client(args, store)
-        payload: dict[str, Any] = {"op": "watch"}
-        if args.watch_channels:
-            payload["channels"] = args.watch_channels
-        if args.timeout_ms is not None:
-            payload["timeout_ms"] = args.timeout_ms
-        if args.watch_session is not None:
-            payload["session_id"] = args.watch_session
         for frame in client.watch(
             channels=args.watch_channels,
             timeout_ms=args.timeout_ms,

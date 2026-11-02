@@ -28,10 +28,12 @@ import sqlite3
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
+import unittest.mock
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -639,6 +641,143 @@ class WakeW0Tests(RunningWireTestCase):
                 session_id=session["session_id"],
                 outcome="completed",
             )
+
+    # ── completion fencing: only a current claimant may report ────────────
+
+    def _claimed(self, task_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        session, wake = self._wake_for_session(task_id)
+        claimed = self.client("tech").claim(
+            wake_id=wake["wake_id"], session_id=session["session_id"]
+        )
+        self.assertEqual(claimed["fencing"]["session_generation"], 1)
+        return session, claimed
+
+    def test_complete_refused_after_claimant_unregisters(self) -> None:
+        session, claimed = self._claimed("T-F1")
+        retired = self.client("tech").unregister_session(
+            session_id=session["session_id"]
+        )
+        self.assertEqual(retired["generation"], 2)
+        with self.assertRaises(WireError) as ctx:
+            self.client("tech").complete(
+                task_ref="T-F1",
+                session_id=session["session_id"],
+                outcome="completed",
+            )
+        self.assertIn("offline", str(ctx.exception))
+        # The refusal wrote nothing: the task is still held by the retired
+        # claimant (visible to the operator) and the wake is still claimed.
+        task = self.store.get_task("T-F1")
+        self.assertEqual(task["state"], "claimed")
+        self.assertIsNone(task["completed_at"])
+        self.assertEqual(
+            self.store.get_wake(claimed["wake"]["wake_id"])["state"], "claimed"
+        )
+        # The operator can still clear the stranded claim.
+        self.assertEqual(
+            self.store.cancel_task(task_id="T-F1", reason="claimant retired")["state"],
+            "cancelled",
+        )
+
+    def test_complete_refused_on_lapsed_lease_until_heartbeat(self) -> None:
+        session, claimed = self._claimed("T-F2")
+        with self.store.connect() as conn:
+            conn.execute(
+                "UPDATE wire_sessions SET lease_expires_at='2000-01-01T00:00:00Z' "
+                "WHERE session_id=?",
+                (session["session_id"],),
+            )
+        with self.assertRaises(WireError) as ctx:
+            self.client("tech").complete(
+                task_ref="T-F2",
+                session_id=session["session_id"],
+                outcome="completed",
+            )
+        self.assertIn("lease expired", str(ctx.exception))
+        self.assertEqual(self.store.get_task("T-F2")["state"], "claimed")
+        # A session that was never retired recovers by renewing its lease.
+        self.client("tech").heartbeat_session(session_id=session["session_id"])
+        done = self.client("tech").complete(
+            task_ref="T-F2", session_id=session["session_id"], outcome="completed"
+        )
+        self.assertEqual(done["task"]["state"], "completed")
+        self.assertEqual(done["wake"]["state"], "completed")
+
+    def test_draining_session_may_still_complete_claimed_work(self) -> None:
+        session, _ = self._claimed("T-F3")
+        self.client("tech").heartbeat_session(
+            session_id=session["session_id"], state="draining"
+        )
+        done = self.client("tech").complete(
+            task_ref="T-F3", session_id=session["session_id"], outcome="failed"
+        )
+        self.assertEqual(done["task"]["state"], "failed")
+
+    # ── wake note: stored with the intent, never silently dropped ─────────
+
+    def test_wake_note_is_persisted_and_visible_to_target(self) -> None:
+        session = self.client("tech").register_session(adapter="test-fake")
+        self.store.add_task(task_id="T-N1", title="t")
+        receipt = self.client("bino").wake(
+            target_seat="tech",
+            task_ref="T-N1",
+            target_session_id=session["session_id"],
+            note="  please look  ",
+        )
+        wake_id = receipt["wake"]["wake_id"]
+        self.assertEqual(receipt["wake"]["note"], "please look")
+        self.assertEqual(self.client("tech").wake_status(wake_id=wake_id)["note"], "please look")
+        listed = self.client("tech").wake_list(state="pending")
+        self.assertEqual([w["note"] for w in listed], ["please look"])
+        # The bound watcher receives the note in its catch-up wake frame.
+        sock, stream, ack = wake_socket(
+            self.store, "tech", {"op": "watch", "session_id": session["session_id"]}
+        )
+        try:
+            self.assertTrue(ack["ok"], ack)
+            frame = json.loads(recv_line(sock, 5.0))
+            self.assertEqual(frame["event"], "wake")
+            self.assertEqual(frame["wake"]["note"], "please look")
+        finally:
+            stream.close()
+            sock.close()
+
+    def test_wake_without_note_records_null_and_bad_notes_are_refused(self) -> None:
+        self.store.add_task(task_id="T-N2", title="t")
+        receipt = self.client("bino").wake(target_seat="tech", task_ref="T-N2")
+        self.assertIn("note", receipt["wake"])
+        self.assertIsNone(receipt["wake"]["note"])
+        for bad in ("   ", "x" * (wake_module.MAX_NOTE_CHARS + 1)):
+            with self.subTest(length=len(bad)):
+                with self.assertRaises(WireError):
+                    self.client("bino").wake(
+                        target_seat="tech", task_ref="T-N2", note=bad
+                    )
+
+    def test_cli_wake_note_round_trips(self) -> None:
+        """The original reproduction: ``wire --json wake ... --note`` used to
+        return a wake record with no note."""
+        self.store.add_task(task_id="t1", title="t")
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "aivengers_wire",
+                "--state-dir", str(self.state_dir), "--json",
+                "wake", "--seat", "bino", "--target-seat", "tech",
+                "--task", "t1", "--note", "please look",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        receipt = json.loads(proc.stdout)
+        self.assertEqual(receipt["wake"]["note"], "please look")
+        stored = self.store.get_wake(receipt["wake"]["wake_id"])
+        self.assertEqual(stored["note"], "please look")
 
     # ── catch-up, restart, expiry, observability ──────────────────────────
 
@@ -1325,6 +1464,189 @@ class GoblinReviewRegressions(RunningWireTestCase):
                 wake_id=w["wake_id"], session_id=s["session_id"]
             )
         self.assertEqual(self.store.get_task("T")["state"], "open")
+
+
+class WakeReplayFlowControlTests(unittest.TestCase):
+    """Catch-up replay is paced by the watcher's own drain.
+
+    A full catch-up batch of maximal-note wakes is ≈ 430 KB, more than
+    SUBSCRIBER_BUFFER_LIMIT. Written as one burst, a small kernel send buffer
+    (macOS: 8 KiB for Unix stream sockets) used to overflow and drop a
+    healthy watcher after ~22 of 32 wakes, on every reconnect.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.store = WireStore(Path(self.temp_dir.name) / "state")
+        self.store.initialize()
+        self.store.add_seat("alice")
+        self.store.add_seat("bob")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @contextmanager
+    def in_process_relay(self, *, sndbuf: int):
+        """Run a real WireServer whose accepted sockets get ``SO_SNDBUF``."""
+        original = WireServer._peer_credentials
+
+        def small_send_buffer(writer):
+            writer.get_extra_info("socket").setsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf
+            )
+            return original(writer)
+
+        server = WireServer(self.store)
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def run() -> None:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(server.start())
+            ready.set()
+            loop.run_forever()
+
+        with unittest.mock.patch.object(
+            WireServer, "_peer_credentials", staticmethod(small_send_buffer)
+        ):
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            self.assertTrue(ready.wait(5), "in-process relay did not start")
+            try:
+                yield server
+            finally:
+                asyncio.run_coroutine_threadsafe(server.close(), loop).result(5)
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(5)
+                loop.close()
+
+    def test_full_batch_of_maximal_notes_replays_without_overflow(self) -> None:
+        self.store.add_task(task_id="t1", title="probe")
+        bob = WireClient(self.store, seat="bob")
+        batch = wake_module.PENDING_REPLAY_BATCH
+        with self.in_process_relay(sndbuf=8192):
+            sid = bob.register_session(adapter="probe")["session_id"]
+            for i in range(batch):
+                self.store.request_wake(
+                    requester=Seat("alice", False),
+                    target_seat="bob",
+                    task_ref="t1",
+                    target_session_id=sid,
+                    note="\x01" * wake_module.MAX_NOTE_CHARS,
+                    idempotency_key=f"k{i}",
+                )
+            events = []
+            for frame in bob.watch(session_id=sid, timeout_ms=10_000):
+                events.append(frame)
+                if sum(e["event"] == "wake" for e in events) == batch:
+                    break
+        kinds = [frame["event"] for frame in events]
+        self.assertNotIn("overflow", kinds)
+        self.assertEqual(kinds, ["subscribed"] + ["wake"] * batch)
+        self.assertTrue(
+            all(len(f["wake"]["note"]) == wake_module.MAX_NOTE_CHARS for f in events[1:])
+        )
+
+    def test_replay_rechecks_state_after_each_drain(self) -> None:
+        """While replay waits on drain, a wake cancelled meanwhile is skipped
+        (not replayed as stale ``pending``), and a watch that ended stops the
+        replay with the rest still pending and unattempted."""
+        sid = self.store.register_session(
+            seat=Seat("bob", False), adapter="fake"
+        )["session_id"]
+        for task in ("D0", "D1", "D2", "D3"):
+            self.store.add_task(task_id=task, title="queued")
+            self.store.request_wake(
+                requester=Seat("alice", False),
+                target_seat="bob",
+                task_ref=task,
+                target_session_id=sid,
+            )
+        server = WireServer(self.store)
+        store = self.store
+
+        class Transport:
+            def get_write_buffer_size(self):
+                return 0
+
+        class Writer:
+            transport = Transport()
+
+            def __init__(self):
+                self.frames = []
+                self.drains = 0
+
+            def write(self, data):
+                self.frames.append(json.loads(data))
+
+            async def drain(self):
+                self.drains += 1
+                if self.drains == 1:
+                    store.cancel_task(task_id="D1", reason="cancelled mid-replay")
+                elif self.drains == 2:
+                    server._unsubscribe(self)  # e.g. the watch timed out
+
+            def close(self):  # pragma: no cover - not expected here
+                raise AssertionError("watcher must not be dropped")
+
+        writer = Writer()
+        server._subscribers[writer] = _Subscription(
+            channels=None, seat="bob", session_id=sid
+        )
+        asyncio.run(server._deliver_pending_wakes(Seat("bob", False), writer))
+        self.assertEqual([f["wake"]["task_ref"] for f in writer.frames], ["D0", "D2"])
+        wakes = {w["task_ref"]: w for w in self.store.list_wakes(seat="bob")}
+        self.assertEqual(wakes["D1"]["state"], "cancelled")
+        self.assertEqual(wakes["D1"]["attempts"], 0)
+        self.assertEqual((wakes["D3"]["state"], wakes["D3"]["attempts"]), ("pending", 0))
+        self.assertEqual((wakes["D2"]["state"], wakes["D2"]["attempts"]), ("pending", 1))
+
+
+class WakeNoteMigrationTests(unittest.TestCase):
+    """A store whose ``wire_wakes`` predates the ``note`` column gains it via
+    the guarded ALTER in ``initialize_wake_tables``; legacy rows read back
+    with ``note: null`` and new wakes keep their note."""
+
+    def test_initialize_adds_note_column_to_legacy_store(self) -> None:
+        legacy_sql = wake_module.WAKE_SCHEMA_SQL.replace("    note TEXT,\n", "", 1)
+        self.assertNotEqual(legacy_sql, wake_module.WAKE_SCHEMA_SQL)
+        with tempfile.TemporaryDirectory() as temp:
+            store = WireStore(Path(temp) / "state")
+            store.state_dir.mkdir(mode=0o700)
+            legacy = sqlite3.connect(store.db_path)
+            try:
+                legacy.executescript(legacy_sql)
+                legacy.execute(
+                    """
+                    INSERT INTO wire_wakes(
+                        wake_id, target_seat, task_ref, requested_by,
+                        state, created_at
+                    ) VALUES ('legacy', 'tech', 'T-OLD', 'bino', 'pending',
+                              '2026-01-01T00:00:00.000000Z')
+                    """
+                )
+                legacy.commit()
+                columns = {row[1] for row in legacy.execute("PRAGMA table_info(wire_wakes)")}
+                self.assertNotIn("note", columns)
+            finally:
+                legacy.close()
+
+            store.initialize()
+            store.add_seat("tech")
+            store.add_seat("bino")
+            store.add_task(task_id="T-NEW", title="t")
+            self.assertIsNone(store.get_wake("legacy")["note"])
+            wake, _, _ = store.request_wake(
+                requester=Seat("bino", False),
+                target_seat="tech",
+                task_ref="T-NEW",
+                note="please look",
+            )
+            self.assertEqual(wake["note"], "please look")
+            self.assertEqual(store.get_wake(wake["wake_id"])["note"], "please look")
+            # Re-initializing an already migrated store is a no-op.
+            store.initialize()
+            self.assertEqual(store.get_wake(wake["wake_id"])["note"], "please look")
 
 
 if __name__ == "__main__":  # pragma: no cover
