@@ -7,6 +7,8 @@ exercised on Linux CI and the Linux code on macOS.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import socket
 import struct
@@ -19,8 +21,11 @@ from pathlib import Path
 from unittest import mock
 
 from aivengers_wire import peercred
+from aivengers_wire.client import WireClient
 from aivengers_wire.errors import WireError
 from aivengers_wire.peercred import peer_credentials
+from aivengers_wire.server import WireServer
+from aivengers_wire.storage import WireStore
 
 SUPPORTED = sys.platform.startswith("linux") or sys.platform == "darwin"
 
@@ -115,6 +120,19 @@ class DarwinBranchTestCase(unittest.TestCase):
         with self.assertRaisesRegex(WireError, "not connected"):
             peer_credentials(sock, platform="darwin")
 
+    def test_unreadable_pid_is_refused_not_fabricated(self) -> None:
+        sock = FakeSocket(
+            {(0, 0x001): _xucred(), (0, 0x002): OSError(57, "Socket is not connected")}
+        )
+        with self.assertRaisesRegex(WireError, "not connected"):
+            peer_credentials(sock, platform="darwin")
+
+    def test_full_group_list_is_accepted(self) -> None:
+        groups = tuple(range(100, 116))
+        sock = FakeSocket({(0, 0x001): _xucred(uid=0, groups=groups), (0, 0x002): struct.pack("@i", 1)})
+        creds = peer_credentials(sock, platform="darwin")
+        self.assertEqual((creds.pid, creds.uid, creds.gid), (1, 0, 100))
+
 
 class LinuxBranchTestCase(unittest.TestCase):
     def test_reads_pid_uid_gid_from_ucred(self) -> None:
@@ -136,6 +154,13 @@ class LinuxBranchTestCase(unittest.TestCase):
             with self.assertRaisesRegex(WireError, "SO_PEERCRED returned 4 bytes, expected 12"):
                 peer_credentials(FakeSocket({(1, 17): b"\0" * 4}), platform="linux")
 
+    def test_kernel_errors_become_wire_errors(self) -> None:
+        fake_socket_module = types.SimpleNamespace(SOL_SOCKET=1, SO_PEERCRED=17)
+        sock = FakeSocket({(1, 17): OSError(92, "Protocol not available")})
+        with mock.patch.object(peercred, "socket", fake_socket_module):
+            with self.assertRaisesRegex(WireError, "unavailable: .*Protocol not available"):
+                peer_credentials(sock, platform="linux")
+
 
 class UnsupportedPlatformTestCase(unittest.TestCase):
     def test_other_platforms_are_refused_not_guessed(self) -> None:
@@ -145,6 +170,60 @@ class UnsupportedPlatformTestCase(unittest.TestCase):
                 with self.assertRaisesRegex(WireError, platform):
                     peer_credentials(sock, platform=platform)
                 self.assertEqual(sock.calls, [])
+
+
+class InProcessRelayTestCase(unittest.TestCase):
+    """Runs WireServer on a background event loop and talks to it as a client."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.store = WireStore(Path(temp.name) / "state")
+        self.store.initialize()
+        self.store.add_seat("tech")
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        server = WireServer(self.store)
+
+        def stop() -> None:
+            asyncio.run_coroutine_threadsafe(server.close(), loop).result(5)
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(5)
+            loop.close()
+
+        self.addCleanup(stop)
+        asyncio.run_coroutine_threadsafe(server.start(), loop).result(5)
+        self.client = WireClient(self.store, seat="tech")
+
+    @unittest.skipUnless(SUPPORTED, "peer credentials are only supported on Linux and macOS")
+    def test_ping_succeeds_and_posts_record_the_kernel_peer(self) -> None:
+        self.assertTrue(self.client.request({"op": "ping"})["ok"])
+        posted = self.client.request(
+            {"op": "post", "channel": "general", "body": "hello"}
+        )["message"]
+        self.assertEqual(
+            posted["peer"],
+            {"pid": os.getpid(), "uid": os.geteuid(), "gid": os.getegid()},
+        )
+
+    def test_refusal_reaches_the_client_on_unsupported_platforms(self) -> None:
+        # The relay reads credentials on accept, before any frame. The test
+        # only reads, so the relay closing first cannot fail a client write.
+        with mock.patch.object(sys, "platform", "sunos5"):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect(str(self.store.socket_path))
+                with sock.makefile("rb") as stream:
+                    frame = json.loads(stream.readline())
+        self.assertEqual(
+            frame,
+            {
+                "ok": False,
+                "error": "operation_failed",
+                "message": "Unix peer credentials are unavailable on platform 'sunos5'",
+            },
+        )
 
 
 if __name__ == "__main__":
