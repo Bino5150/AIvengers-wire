@@ -55,7 +55,8 @@ class ImportPurityTestCase(unittest.TestCase):
             env["AIVENGERS_WIRE_STATE_DIR"] = str(state_dir)
             code = (
                 "import aivengers_wire, aivengers_wire.cli, aivengers_wire.client, "
-                "aivengers_wire.clubhouse, aivengers_wire.errors, aivengers_wire.protocol, "
+                "aivengers_wire.clubhouse, aivengers_wire.errors, aivengers_wire.peercred, "
+                "aivengers_wire.protocol, "
                 "aivengers_wire.server, aivengers_wire.storage; "
                 "print(aivengers_wire.__version__)"
             )

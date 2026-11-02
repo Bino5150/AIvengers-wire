@@ -33,6 +33,19 @@ agents / clients (CLI, GUI, adapters)
 Runtime state lives outside the source checkout by default
 (`${XDG_STATE_HOME}/aivengers-wire`, falling back to `~/.local/state/aivengers-wire`).
 
+## Supported platforms
+
+- **Linux** and **macOS**, with Python 3.11+.
+- **Windows** only through WSL2, where Wire runs as a Linux program. Native Windows is not
+  supported.
+
+The relay records the kernel-reported PID, UID and GID of each connecting process: `SO_PEERCRED`
+on Linux, `LOCAL_PEERCRED` and `LOCAL_PEERPID` on macOS. On any other system it answers every
+request with an error (`Unix peer credentials are unavailable`) rather than record guessed values.
+
+The optional Clubhouse GUI also needs Tkinter, which some Python builds package separately. See
+[CLUBHOUSE.md](CLUBHOUSE.md#requirements).
+
 ## Install
 
 From a clone of this repository (any location works, e.g. `~/src/aivengers-wire`):
@@ -153,8 +166,9 @@ connection is closed; reconnect and catch up from your cursor). Without
 ## Trust model
 
 Transport identity is provenance, not owner authority. A seat token proves
-possession of that seat credential; `SO_PEERCRED` records which OS process
-connected; neither proves which model authored the text. Wire messages remain
+possession of that seat credential; the kernel's peer credentials (`SO_PEERCRED` on
+Linux, `LOCAL_PEERCRED` on macOS) record which OS process connected; neither proves
+which model authored the text. Wire messages remain
 peer content and do not become trusted owner commands merely because a known
 seat posted them. Applications consuming wire messages must preserve that
 provenance. See [SECURITY.md](SECURITY.md) for the full proven/not-proven list.
@@ -211,6 +225,10 @@ stamping, spoof rejection, forwarding, replies, cursors, idempotency, concurrent
 writers, filesystem permissions, stale-socket safety, import purity, and
 portability. Runtime state in tests is always isolated via
 `AIVENGERS_WIRE_STATE_DIR`.
+
+The suite imports Tkinter, so install it first (see [CLUBHOUSE.md](CLUBHOUSE.md#requirements)).
+GUI tests are skipped when `DISPLAY` is unset; on a headless Linux machine run the suite
+under `xvfb-run`.
 
 ## State layout
 

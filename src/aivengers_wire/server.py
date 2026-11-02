@@ -8,12 +8,12 @@ import logging
 import os
 import socket
 import stat
-import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .errors import AuthenticationError, ProtocolError, WireError
+from .peercred import read_peer_credentials
 from .protocol import (
     MAX_FRAME_BYTES,
     decode_frame,
@@ -190,14 +190,7 @@ class WireServer:
 
     @staticmethod
     def _peer_credentials(writer: asyncio.StreamWriter) -> PeerCredentials:
-        peer_socket = writer.get_extra_info("socket")
-        if peer_socket is None or not hasattr(socket, "SO_PEERCRED"):
-            raise WireError("Unix peer credentials are unavailable")
-        raw = peer_socket.getsockopt(
-            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
-        )
-        pid, uid, gid = struct.unpack("3i", raw)
-        return PeerCredentials(pid=pid, uid=uid, gid=gid)
+        return read_peer_credentials(writer.get_extra_info("socket"))
 
     async def _read_request(self, reader: asyncio.StreamReader) -> dict[str, Any] | None:
         try:

@@ -409,6 +409,9 @@ class WatchNotificationTests(RunningWireTestCase):
             time.sleep(0.01)
         self.fail(f"{description}: relay socket-fd count never reached {expected}")
 
+    @unittest.skipUnless(
+        Path("/proc/self/fd").is_dir(), "counts relay socket fds through /proc (Linux)"
+    )
     def test_poster_disconnect_cannot_suppress_persisted_wakeup(self) -> None:
         """R1/F1 regression, R2-hardened: the poster genuinely disconnects.
 

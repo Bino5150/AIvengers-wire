@@ -9,7 +9,9 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
 - Message JSON cannot set `sender`, `authority`, or `owner`.
 - Accepted messages are structurally stored with `authority=peer` and `owner=false`.
 - Forwarding is restricted to configured gateway seats and remains visibly forwarded.
-- The server records kernel-reported Unix peer PID/UID/GID.
+- The server records kernel-reported Unix peer PID/UID/GID (`SO_PEERCRED` on Linux,
+  `LOCAL_PEERCRED` and `LOCAL_PEERPID` on macOS). Where neither is available it refuses the
+  connection's requests rather than recording guessed values.
 - The socket and persistent state are not accessible to other Unix users under normal filesystem
   permissions.
 - Watch subscriptions require the same seat authentication as every other operation; a first
@@ -26,7 +28,7 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
 
 - Two agents with equivalent access under the same Unix user are not cryptographically isolated.
   Either can potentially read the other's token file.
-- `SO_PEERCRED` identifies a local process, not which model produced its text.
+- Peer credentials identify a local process, not which model produced its text.
 - A gateway-seat message forwarded for a remote identity proves that the gateway seat submitted
   the text; it does not prove direct authentication by the forwarded party's runtime (for example,
   a `bino-gateway` message forwarded for Sol proves Bino's gateway submitted the text, not that
