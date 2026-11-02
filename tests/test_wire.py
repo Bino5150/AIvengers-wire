@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import re
 import signal
 import socket
 import stat
@@ -12,11 +13,13 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from pathlib import Path
 
 import tkinter as tk
 
+from aivengers_wire import cli, server as server_module
 from aivengers_wire.client import WireClient
 from aivengers_wire.clubhouse import (
     ClubhouseApp,
@@ -25,12 +28,16 @@ from aivengers_wire.clubhouse import (
     build_identity_routes,
 )
 from aivengers_wire.errors import WireError, WireResponseTooLargeError
-from aivengers_wire.protocol import MAX_FRAME_BYTES, encode_frame
-from aivengers_wire.server import WireServer
+from aivengers_wire.protocol import MAX_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, encode_frame
+from aivengers_wire.server import WireServer, _fit_listing_response
 from aivengers_wire.storage import WireStore
 
 
-class RunningWireTestCase(unittest.TestCase):
+class RelayFixture(unittest.TestCase):
+    """A real relay subprocess with four seats. Defines no tests of its own,
+    so test classes built on it run once; other modules subclass
+    RunningWireTestCase, which re-runs its tests in every subclass."""
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.state_dir = Path(self.temp_dir.name) / "state"
@@ -106,6 +113,27 @@ class RunningWireTestCase(unittest.TestCase):
         finally:
             sock.close()
 
+    def wire(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run the real ``wire`` CLI against this test's relay."""
+        project_root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(project_root / "src")
+        env.pop("AIVENGERS_WIRE_SEAT", None)
+        return subprocess.run(
+            [sys.executable, "-m", "aivengers_wire", "--state-dir", str(self.state_dir), *args],
+            cwd=project_root,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def stored(self, channel: str) -> list[dict[str, object]]:
+        return self.client("tech").read_messages(channel=channel, after=0, limit=200)["messages"]
+
+
+class RunningWireTestCase(RelayFixture):
     def test_direct_message_has_structural_peer_envelope(self) -> None:
         response = self.client("tech").request(
             {"op": "post", "channel": "general", "body": "Rookie, check the socket."}
@@ -345,10 +373,15 @@ class RunningWireTestCase(unittest.TestCase):
                 payload["forwarded_for"] = "sol"
             posted = self.client(seat).request(payload)["message"]
             expected.append({key: value for key, value in posted.items() if key != "duplicate"})
-        with self.assertRaisesRegex(WireError, "response exceeds maximum frame size"):
-            self.client("bino").request(
-                {"op": "read", "channel": "general", "after": 0, "limit": 200}
-            )
+        # The relay trims the page to its frame budget and says how to continue.
+        page = self.client("bino").request(
+            {"op": "read", "channel": "general", "after": 0, "limit": 200}
+        )
+        self.assertLessEqual(len(encode_frame(page)), MAX_FRAME_BYTES)
+        self.assertTrue(0 < len(page["messages"]) < 200)
+        self.assertEqual(page["messages"], expected[: len(page["messages"])])
+        self.assertTrue(page["has_more"])
+        self.assertEqual(page["next_after"], page["messages"][-1]["id"])
         service = ClubhouseService(self.store, seat="bino")
         self.assertEqual(service.read_channel("general"), expected)
         self.assertEqual(service.read_channel("general", after=expected[99]["id"]), expected[100:])
@@ -399,12 +432,254 @@ class RunningWireTestCase(unittest.TestCase):
                 root.destroy()
 
 
+class BoundedResponseTests(RelayFixture):
+    """Post echoes and read pages fit the response bound; CLI retries are safe."""
+
+    def test_cli_post_with_response_over_64_kib_succeeds_and_retries_safely(self) -> None:
+        # Repro: this body fits the 64 KiB request frame, but the echoed
+        # message does not fit 64 KiB. The CLI used to exit 2 although the
+        # post was stored, and a retry without a client_id stored it twice.
+        self.store.add_seat("alice")
+        body = "€" * 21_800
+        request = encode_frame(
+            {"op": "post", "channel": "general", "body": body, "client_id": "cli-" + "0" * 32}
+        )
+        self.assertLessEqual(len(request), MAX_FRAME_BYTES)
+        result = self.wire("post", "--seat", "alice", "general", body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("#general alice", result.stdout)
+        stored = self.stored("general")
+        self.assertEqual([message["body"] for message in stored], [body])
+        client_id = stored[0]["client_id"]
+        self.assertRegex(client_id, r"^cli-[0-9a-f]{32}$")
+        # The echo really is over the request bound, and within the response bound.
+        echo = self.client("alice").request(
+            {"op": "post", "channel": "general", "body": body, "client_id": client_id}
+        )
+        self.assertTrue(echo["message"]["duplicate"])
+        self.assertGreater(len(encode_frame(echo)), MAX_FRAME_BYTES)
+        self.assertLessEqual(len(encode_frame(echo)), MAX_RESPONSE_FRAME_BYTES)
+        retry = self.wire("post", "--seat", "alice", "general", body, "--client-id", client_id)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertIn(f"already stored with client_id {client_id}", retry.stdout)
+        self.assertEqual(len(self.stored("general")), 1)
+
+    def test_cli_post_failure_prints_client_id_for_a_safe_retry(self) -> None:
+        real_request = WireClient.request
+
+        def response_lost(client: WireClient, payload: dict[str, object]) -> dict[str, object]:
+            real_request(client, payload)  # the relay stores the post ...
+            raise WireError("connection reset before the response arrived")  # ... the reply is lost
+
+        argv = ["--state-dir", str(self.state_dir), "post", "--seat", "tech", "general", "once"]
+        stderr = io.StringIO()
+        with mock.patch.object(WireClient, "request", response_lost), redirect_stderr(
+            stderr
+        ), redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(argv), 2)
+        self.assertIn("wire: connection reset before the response arrived", stderr.getvalue())
+        match = re.search(r"--client-id (cli-[0-9a-f]{32})", stderr.getvalue())
+        self.assertIsNotNone(match, stderr.getvalue())
+        assert match is not None
+        self.assertEqual([m["client_id"] for m in self.stored("general")], [match.group(1)])
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(cli.main(argv + ["--client-id", match.group(1)]), 0)
+        self.assertIn("not stored again", stdout.getvalue())
+        self.assertEqual([m["body"] for m in self.stored("general")], ["once"])
+
+        # A definite refusal prints the client_id too; reply is covered as well.
+        refused = self.wire("reply", "--seat", "tech", "general", "999", "no such parent")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("reply target 999 does not exist", refused.stderr)
+        self.assertRegex(refused.stderr, r"this reply used client_id cli-[0-9a-f]{32}")
+
+    def test_cli_read_follows_byte_bounded_pages(self) -> None:
+        # Repro: two 32 KiB posts made `wire read` (default --limit 50) exit 2.
+        self.store.add_seat("alice")
+        self.store.add_seat("bob")
+        body = "a" * 32_768
+        ids = [
+            self.client("alice").request({"op": "post", "channel": "big", "body": body})[
+                "message"
+            ]["id"]
+            for _ in range(2)
+        ]
+        page = self.client("bob").request(
+            {"op": "read", "channel": "big", "after": 0, "limit": 50}
+        )
+        self.assertLessEqual(len(encode_frame(page)), MAX_FRAME_BYTES)
+        self.assertEqual([m["id"] for m in page["messages"]], ids[:1])
+        self.assertEqual((page["has_more"], page["next_after"]), (True, ids[0]))
+
+        result = self.wire("read", "--seat", "bob", "big")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count(body), 2)
+        self.assertNotIn("more messages", result.stdout)
+        as_json = json.loads(self.wire("--json", "read", "--seat", "bob", "big").stdout)
+        self.assertEqual([m["id"] for m in as_json["messages"]], ids)
+        self.assertEqual((as_json["has_more"], as_json["next_after"]), (False, None))
+
+        one = self.wire("read", "--seat", "bob", "big", "--limit", "1")
+        self.assertEqual(one.returncode, 0, one.stderr)
+        self.assertEqual(one.stdout.count(body), 1)
+        self.assertIn(f"continue with --after {ids[0]}", one.stdout)
+        advanced = self.wire("read", "--seat", "bob", "big", "--limit", "1", "--advance")
+        self.assertIn("the cursor advanced, run again to continue", advanced.stdout)
+        self.assertEqual(
+            self.client("bob").request({"op": "cursor", "channel": "big"})["last_message_id"],
+            ids[0],
+        )
+        rest = self.wire("read", "--seat", "bob", "big", "--advance")
+        self.assertEqual(rest.stdout.count(body), 1)
+        self.assertIn(f"[{ids[1]}]", rest.stdout)
+
+    def test_single_message_over_64_kib_reads_with_limit_one(self) -> None:
+        # Repro: one large non-ASCII message was unreadable even with --limit 1.
+        body = "€" * 21_800
+        posted = self.client("tech").request({"op": "post", "channel": "euro", "body": body})
+        page = self.client("rookie").request(
+            {"op": "read", "channel": "euro", "after": 0, "limit": 1}
+        )
+        self.assertEqual(page["messages"][0]["id"], posted["message"]["id"])
+        self.assertEqual(page["messages"][0]["body"], body)
+        self.assertGreater(len(encode_frame(page)), MAX_FRAME_BYTES)
+        self.assertLessEqual(len(encode_frame(page)), MAX_RESPONSE_FRAME_BYTES)
+        for limit in ("1", "50"):
+            result = self.wire("read", "--seat", "rookie", "euro", "--limit", limit)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(body, result.stdout)
+
+    def test_largest_legal_message_fits_post_read_and_watch_frames(self) -> None:
+        gateway = "g" * 64
+        self.store.add_seat(gateway, can_forward=True)
+        channel = "c" * 64
+        parent = self.client("tech").request(
+            {"op": "post", "channel": channel, "body": "parent"}
+        )["message"]["id"]
+        payload: dict[str, object] = {
+            "op": "post",
+            "channel": channel,
+            "body": "",
+            "reply_to": parent,
+            "forwarded_for": "f" * 64,
+            "client_id": "\x01" * 128,
+        }
+        # Control characters cost six bytes in any JSON encoding: the worst case.
+        payload["body"] = "\x01" * ((MAX_FRAME_BYTES - len(encode_frame(payload))) // 6)
+        request = encode_frame(payload)
+        self.assertGreater(len(request), MAX_FRAME_BYTES - 6)
+        self.assertLessEqual(len(request), MAX_FRAME_BYTES)
+
+        events = self.client("rookie").watch(channels=[channel], timeout_ms=10_000)
+        try:
+            self.assertEqual(next(events)["event"], "subscribed")
+            posted = WireClient(self.store, seat=gateway).request(payload)
+            event = next(events)
+        finally:
+            events.close()
+        self.assertEqual(event["event"], "message")
+        self.client("tech").request({"op": "post", "channel": channel, "body": "after"})
+        page = self.client("rookie").request(
+            {"op": "read", "channel": channel, "after": parent, "limit": 1}
+        )
+        self.assertEqual(page["messages"][0]["body"], payload["body"])
+        self.assertEqual((page["has_more"], page["next_after"]), (True, page["messages"][0]["id"]))
+        for name, frame in (("post", posted), ("read", page), ("watch", event)):
+            with self.subTest(frame=name):
+                size = len(encode_frame(frame))
+                self.assertGreater(size, MAX_FRAME_BYTES)
+                # README: the relay's envelope adds under 1 KiB to the request.
+                self.assertLess(size - len(request), 1_024)
+                self.assertLessEqual(size, MAX_RESPONSE_FRAME_BYTES)
+
+    def test_read_pages_are_byte_bounded_lossless_and_truthful(self) -> None:
+        ids = [
+            self.client("tech").request(
+                {
+                    "op": "post",
+                    "channel": "mixed",
+                    "body": "x" * 25_000 if index % 3 == 0 else f"small {index}",
+                }
+            )["message"]["id"]
+            for index in range(12)
+        ]
+        seen: list[int] = []
+        after = 0
+        for _ in range(20):
+            page = self.client("rookie").request(
+                {"op": "read", "channel": "mixed", "after": after, "limit": 5}
+            )
+            self.assertTrue(page["messages"])
+            self.assertLessEqual(len(encode_frame(page)), MAX_FRAME_BYTES)
+            seen.extend(message["id"] for message in page["messages"])
+            if not page["has_more"]:
+                self.assertIsNone(page["next_after"])
+                break
+            self.assertEqual(page["next_after"], page["messages"][-1]["id"])
+            after = page["next_after"]
+        self.assertEqual(seen, ids)
+
+        small = [
+            self.client("tech").request({"op": "post", "channel": "small", "body": str(n)})[
+                "message"
+            ]["id"]
+            for n in range(3)
+        ]
+        exact = self.client("rookie").request(
+            {"op": "read", "channel": "small", "after": 0, "limit": 3}
+        )
+        self.assertEqual([m["id"] for m in exact["messages"]], small)
+        self.assertEqual((exact["has_more"], exact["next_after"]), (False, None))
+        short = self.client("rookie").request(
+            {"op": "read", "channel": "small", "after": 0, "limit": 2}
+        )
+        self.assertEqual((short["has_more"], short["next_after"]), (True, small[1]))
+        empty = self.client("rookie").request(
+            {"op": "read", "channel": "nothing", "after": 0, "limit": 5}
+        )
+        self.assertEqual(empty, {"ok": True, "messages": [], "has_more": False, "next_after": None})
+
+
+class ReadPageFitTestCase(unittest.TestCase):
+    def test_read_fit_keeps_one_large_row_and_encodes_linearly(self) -> None:
+        rows = [{"id": index, "body": "x" * 60_000} for index in range(1, 202)]
+        encoded: list[int] = []
+        real_encode = server_module.encode_frame
+
+        def counting_encode(value: dict[str, object]) -> bytes:
+            raw = real_encode(value)
+            encoded.append(len(raw))
+            return raw
+
+        with mock.patch.object(server_module, "encode_frame", counting_encode):
+            response = _fit_listing_response(
+                {"messages": rows[:200], "has_more": True},
+                "messages",
+                cursor_field_a="id",
+                single_row_budget=MAX_RESPONSE_FRAME_BYTES,
+            )
+        self.assertEqual([row["id"] for row in response["messages"]], [1])
+        self.assertEqual((response["has_more"], response["next_after"]), (True, 1))
+        # Trimming a 12 MB page must not re-encode it once per dropped row.
+        self.assertLess(sum(encoded), 4 * MAX_RESPONSE_FRAME_BYTES)
+
+    def test_read_fit_refuses_a_single_row_over_the_response_bound(self) -> None:
+        with self.assertRaisesRegex(WireError, "single stored row cannot fit"):
+            _fit_listing_response(
+                {"messages": [{"id": 1, "body": "x" * MAX_RESPONSE_FRAME_BYTES}], "has_more": False},
+                "messages",
+                cursor_field_a="id",
+                single_row_budget=MAX_RESPONSE_FRAME_BYTES,
+            )
+
+
 class HistoryPagingSafetyTestCase(unittest.TestCase):
     def test_client_preserves_exact_frame_boundary_and_typed_overflow(self) -> None:
         payload = {"ok": True, "padding": ""}
-        payload["padding"] = "x" * (MAX_FRAME_BYTES - len(encode_frame(payload)))
+        payload["padding"] = "x" * (MAX_RESPONSE_FRAME_BYTES - len(encode_frame(payload)))
         raw = encode_frame(payload)
-        self.assertEqual(len(raw), MAX_FRAME_BYTES)
+        self.assertEqual(len(raw), MAX_RESPONSE_FRAME_BYTES)
         self.assertEqual(WireClient._read(io.BytesIO(raw)), payload)
         payload["padding"] += "x"
         with self.assertRaises(WireResponseTooLargeError):

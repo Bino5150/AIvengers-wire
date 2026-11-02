@@ -103,7 +103,11 @@ class ClubhouseService:
                 break
             messages.extend(page)
             cursor = page[-1]["id"]
-            if len(page) < limit:
+            # The relay trims pages to its frame budget and says whether more
+            # remain; a relay that predates bounded reads reports nothing, and
+            # a short page then means the end.
+            more = response.get("has_more")
+            if more is False or (more is None and len(page) < limit):
                 break
         return messages
 

@@ -8,7 +8,25 @@ from typing import Any, Iterable
 
 from .errors import ProtocolError
 
+#: Largest request frame (client to relay), newline included.
 MAX_FRAME_BYTES = 65_536
+
+#: Largest response or event frame (relay to client), newline included. The
+#: core client accepts exactly this much.
+#:
+#: Any single stored message fits. Its text fields (body, channel, client_id,
+#: forwarded_for) arrived in one post request of at most MAX_FRAME_BYTES, and
+#: the relay's compact UTF-8 JSON never encodes a string in more bytes than the
+#: shortest legal JSON encoding of it. The relay-stamped fields (id, uuid, seat
+#: name, timestamp, peer credentials) and the frame envelope add under 1 KiB.
+#: So the post response, a one-message ``read`` page and a ``watch`` event for
+#: the largest legal message all stay far below this bound.
+#:
+#: Pages of several rows (``read``, ``sessions``, ``wake_list``) are still
+#: trimmed to MAX_FRAME_BYTES, so clients built with a 64 KiB cap keep working
+#: for everything except a single message that is itself over 64 KiB.
+MAX_RESPONSE_FRAME_BYTES = 2 * MAX_FRAME_BYTES
+
 MAX_BODY_CHARS = 32_768
 MAX_CLIENT_ID_CHARS = 128
 MAX_READ_LIMIT = 200

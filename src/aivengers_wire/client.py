@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .errors import WireError, WireResponseTooLargeError
-from .protocol import MAX_FRAME_BYTES, encode_frame, validate_name
+from .protocol import MAX_RESPONSE_FRAME_BYTES, encode_frame, validate_name
 from .storage import WireStore, load_token
 
 #: Socket failures a request or watch can hit on the way to, or while talking
@@ -67,10 +67,13 @@ class WireClient:
 
     @staticmethod
     def _read(stream: Any) -> dict[str, Any]:
-        raw = stream.readline(MAX_FRAME_BYTES + 1)
+        # Responses are bounded by MAX_RESPONSE_FRAME_BYTES, not the request
+        # bound: the response to any legal post, and any single stored
+        # message, fits it (see protocol.py).
+        raw = stream.readline(MAX_RESPONSE_FRAME_BYTES + 1)
         if not raw:
             raise WireError("wire server closed the connection without a response")
-        if len(raw) > MAX_FRAME_BYTES:
+        if len(raw) > MAX_RESPONSE_FRAME_BYTES:
             raise WireResponseTooLargeError("wire server response exceeds maximum frame size")
         try:
             response = json.loads(raw.decode("utf-8"))
@@ -79,6 +82,47 @@ class WireClient:
         if not isinstance(response, dict):
             raise WireError("wire server returned a non-object response")
         return response
+
+    def read_messages(
+        self, *, channel: str | None, after: int, limit: int
+    ) -> dict[str, Any]:
+        """Read up to ``limit`` messages after ``after``, following continuations.
+
+        The relay bounds each ``read`` page by bytes and reports ``has_more``
+        and ``next_after``; this keeps reading from the last returned id until
+        ``limit`` messages have arrived or none remain. The first request
+        carries ``limit`` unchanged, so the relay validates it as before.
+
+        Returns ``{"messages": [...], "has_more": ..., "next_after": ...}``.
+        ``next_after`` is the id to pass as ``after`` to continue, or None
+        when nothing remains. ``has_more`` is None when the relay predates
+        bounded reads (it reports no ``has_more``); then only one page is read.
+        """
+        messages: list[dict[str, Any]] = []
+        while True:
+            payload: dict[str, Any] = {
+                "op": "read",
+                "after": after,
+                "limit": limit - len(messages),
+            }
+            if channel is not None:
+                payload["channel"] = channel
+            response = self.request(payload)
+            page = response["messages"]
+            messages.extend(page)
+            has_more = response.get("has_more")
+            if not isinstance(has_more, bool):
+                return {"messages": messages, "has_more": None, "next_after": None}
+            if has_more and not page:
+                raise WireError("wire server reported more messages but returned none")
+            if not has_more or len(messages) >= limit:
+                break
+            after = page[-1]["id"]
+        return {
+            "messages": messages,
+            "has_more": has_more,
+            "next_after": messages[-1]["id"] if has_more else None,
+        }
 
     # ── watch: streaming notification listener ────────────────────────────
 

@@ -15,6 +15,7 @@ from typing import Any
 from .errors import AuthenticationError, ProtocolError, WireError
 from .protocol import (
     MAX_FRAME_BYTES,
+    MAX_RESPONSE_FRAME_BYTES,
     decode_frame,
     encode_frame,
     require_exact_keys,
@@ -37,8 +38,9 @@ def _fit_listing_response(
     rows_key: str,
     *,
     cursor_field_a: str,
-    cursor_field_b: str,
+    cursor_field_b: str | None = None,
     budget: int = MAX_FRAME_BYTES,
+    single_row_budget: int | None = None,
 ) -> dict[str, Any]:
     """Bound a listing response by its ACTUAL FINAL transport size.
 
@@ -65,17 +67,31 @@ def _fit_listing_response(
     dropped, and the cursor always names the last INCLUDED row, so a
     consumer walking pages can never loop forever (the cursor advances
     or ``has_more`` goes false).
+
+    ``cursor_field_b=None`` makes ``next_after`` the scalar
+    ``cursor_field_a`` of the last included row (``read`` uses the message
+    id, which callers pass back as ``after``) instead of a two-field keyset.
+
+    ``single_row_budget`` (``read``): the page is never trimmed below one
+    row, and a page of exactly one row may use this larger budget. Every
+    legal stored message fits MAX_RESPONSE_FRAME_BYTES (see protocol.py), so
+    ``read`` can always return the next message, while pages of several
+    messages still fit ``budget``.
     """
     rows = response[rows_key]
     started_empty = not rows
+    keep = 0 if single_row_budget is None else 1
 
     def _refresh_cursor() -> None:
         if response["has_more"] and rows:
             last = rows[-1]
-            response["next_after"] = {
-                cursor_field_a: last[cursor_field_a],
-                cursor_field_b: last[cursor_field_b],
-            }
+            if cursor_field_b is None:
+                response["next_after"] = last[cursor_field_a]
+            else:
+                response["next_after"] = {
+                    cursor_field_a: last[cursor_field_a],
+                    cursor_field_b: last[cursor_field_b],
+                }
         else:
             response["next_after"] = None
 
@@ -84,15 +100,37 @@ def _fit_listing_response(
         # ordinary client actually reads and bounds-checks.
         return len(encode_frame({"ok": True, **response}))
 
+    # Pre-trim in one linear pass. Each row encodes the same inside the list
+    # as on its own, so once the rows alone (plus their separating commas)
+    # pass the budget, no page holding them can fit, whatever the envelope.
+    # This drops only rows the exact loop below would drop too, and spares it
+    # from re-encoding a multi-megabyte page once per trimmed row.
+    used = 0
+    for index, row in enumerate(rows):
+        used += len(encode_frame(row)) - 1 + (1 if index else 0)
+        if used > budget and index >= keep:
+            del rows[index:]
+            response["has_more"] = True
+            break
+
     # Cursor metadata exists BEFORE the first size measurement (R3-B).
     _refresh_cursor()
-    while rows and _wire_bytes() > budget:
+    while len(rows) > keep and _wire_bytes() > budget:
         rows.pop()
         response["has_more"] = True
         _refresh_cursor()
     if not rows and not started_empty:
         raise WireError(
             "listing response cannot fit the transport frame budget; "
+            "this indicates an admission-cap contract violation"
+        )
+    if (
+        len(rows) == 1
+        and single_row_budget is not None
+        and _wire_bytes() > max(budget, single_row_budget)
+    ):
+        raise WireError(
+            "a single stored row cannot fit the response frame bound; "
             "this indicates an admission-cap contract violation"
         )
     return response
@@ -373,11 +411,19 @@ class WireServer:
             )
             after = validate_nonnegative_int(request["after"], field="after")
             limit = validate_read_limit(request["limit"])
-            return {
-                "messages": self.store.read_messages(
-                    channel=channel, after=after, limit=limit
-                )
-            }
+            # One sentinel row beyond the limit makes has_more truthful at
+            # the limit. The page is then bounded by its complete transport
+            # frame like the other listings: trailing messages are trimmed
+            # (never below one, which always fits the response bound) and
+            # stay reachable through next_after. ``messages`` keeps its shape;
+            # has_more and next_after are additive for older clients.
+            rows = self.store.read_messages(channel=channel, after=after, limit=limit + 1)
+            return _fit_listing_response(
+                {"messages": rows[:limit], "has_more": len(rows) > limit},
+                "messages",
+                cursor_field_a="id",
+                single_row_budget=MAX_RESPONSE_FRAME_BYTES,
+            )
         if op == "cursor":
             require_exact_keys(request, required={"op", "channel"})
             channel = validate_name(request["channel"], field="channel")
