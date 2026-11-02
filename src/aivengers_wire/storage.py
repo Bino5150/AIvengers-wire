@@ -393,14 +393,31 @@ class WireStore(WakeStoreMixin):
         assert row is not None
         return int(row["max_id"])
 
-    def list_channels(self) -> list[dict[str, Any]]:
+    def list_channels(
+        self, *, after: str | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Channels in name order, optionally one keyset page of them.
+
+        ``after`` is exclusive (names are compared bytewise, the order
+        ``ORDER BY channel`` yields), so a page's last name is the exact
+        continuation point. ``limit`` bounds both the rows returned and the
+        work done: ``idx_messages_channel_id`` yields the groups in order, so
+        SQLite stops after ``limit`` of them.
+        """
+        query = (
+            "SELECT channel, COUNT(*) AS message_count, MAX(id) AS latest_message_id "
+            "FROM messages"
+        )
+        params: list[Any] = []
+        if after is not None:
+            query += " WHERE channel > ?"
+            params.append(after)
+        query += " GROUP BY channel ORDER BY channel"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
         with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT channel, COUNT(*) AS message_count, MAX(id) AS latest_message_id
-                FROM messages GROUP BY channel ORDER BY channel
-                """
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
     @staticmethod

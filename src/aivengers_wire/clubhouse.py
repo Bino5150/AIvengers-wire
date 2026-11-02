@@ -75,8 +75,7 @@ class ClubhouseService:
         return self._client(self.seat).request({"op": "ping"})
 
     def channels(self) -> list[str]:
-        response = self._client(self.seat).request({"op": "channels"})
-        discovered = {item["channel"] for item in response["channels"]}
+        discovered = {item["channel"] for item in self._client(self.seat).list_channels()}
         return list(DEFAULT_CHANNELS) + sorted(discovered - set(DEFAULT_CHANNELS))
 
     def read_channel(self, channel: str, *, after: int = 0) -> list[dict[str, Any]]:

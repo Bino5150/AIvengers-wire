@@ -155,8 +155,43 @@ If `BODY` is omitted, `post` and `reply` read it from standard input.
   each seat's `client_id` at most once and answers a repeat with the stored message,
   and the CLI then prints `-- already stored …`.
 
-`channels` is not paged, so a very large channel inventory can still exceed the
-response bound.
+- **`channels` pages are opt-in.** Send `{"op":"channels","limit":N}` (1 to 500) and
+  continue with `"after"` set to the previous page's `next_after`. Channels come in name
+  order, `after` is exclusive, and a page is trimmed to its complete 65,536-byte frame.
+  `has_more` and `next_after` are truthful, so the pages together list every channel that
+  existed throughout the walk exactly once. A channel created behind the cursor shows up in
+  the next fresh walk. `wire channels`, Clubhouse and `WireClient.list_channels()` page
+  automatically. Against a relay that predates paging they fall back to the unpaged
+  request, so updating clients before the relay still works.
+- **An unpaged `channels` request** (no `limit`, which is what the Codex and Claude Code
+  adapters send) is never truncated, because those clients take it for the whole inventory.
+  It returns the complete list as before, plus `has_more: false`, when that fits 1 MiB (the
+  largest response any shipped consumer accepts). A larger inventory is refused with a small
+  `operation_failed` error that names the paged form; it no longer builds an unbounded frame.
+  Adapters keep working unchanged below that size. Above it they cannot list channels until
+  they adopt paging, which is the same outcome they had when the relay's oversized frame
+  exceeded their own caps.
+
+### Connection limits
+
+A connection must deliver one complete, valid authentication frame within 10 seconds of
+being accepted. The deadline covers the whole frame, so trickling bytes does not extend it.
+At most 64 connections (32 per client process, by kernel-reported PID) may be waiting to
+authenticate. When a limit is reached, the relay closes the oldest waiting connection if it
+has waited at least a second, to make room. Otherwise it refuses the newcomer with a short
+`operation_failed` error ("retry shortly"). Either way the client receives an error frame
+and a closed socket. Authenticated connections do not count against these limits and have
+no deadline, so a `watch` can idle for hours. Shutdown does not wait for connections that
+are still authenticating.
+
+### Text encoding
+
+Request text must be valid Unicode. A JSON `\uD800`-style escape that is not part of a
+valid surrogate pair is refused as `invalid_request` before any handler runs, wherever it
+appears (values or keys, including the authentication frame). Nothing is stored and the
+connection ends. A refused request never reaches storage, so retrying with the same
+`client_id` after correcting the text stores the message once. Excessively nested JSON is
+refused the same way.
 
 ### Required rollout order
 

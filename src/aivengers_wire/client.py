@@ -23,6 +23,11 @@ TRANSPORT_ERRORS: tuple[type[OSError], ...] = (
     socket.timeout,
 )
 
+#: Rows asked of the relay per ``channels`` page, and the most pages a listing
+#: may take (a runaway guard: 1,000 pages is 200,000 channels).
+CHANNELS_PAGE_SIZE = 200
+MAX_CHANNEL_PAGES = 1_000
+
 
 class WireClient:
     def __init__(self, store: WireStore, *, seat: str, token_path: Path | None = None):
@@ -44,7 +49,10 @@ class WireClient:
                 self._write(stream, payload)
                 response = self._read(stream)
                 if not response.get("ok"):
-                    raise WireError(response.get("message", "wire operation failed"))
+                    error = WireError(response.get("message", "wire operation failed"))
+                    code = response.get("error")
+                    error.code = code if isinstance(code, str) else None
+                    raise error
                 return response
         except TRANSPORT_ERRORS as exc:
             raise self._transport_error(exc) from exc
@@ -133,6 +141,38 @@ class WireClient:
             "has_more": has_more,
             "next_after": messages[-1]["id"] if has_more else None,
         }
+
+    def list_channels(self, *, page_size: int = CHANNELS_PAGE_SIZE) -> list[dict[str, Any]]:
+        """Every channel row, in name order, however many channels exist.
+
+        Walks the relay's ``channels`` pages by ``has_more``/``next_after`` so
+        no single response has to hold the whole inventory. A relay that
+        predates paging refuses the ``limit`` field as an unknown field; the
+        unpaged request that relay understands is then sent instead, which
+        is exactly what this method's callers sent before. A page that does
+        not advance the cursor raises rather than looping.
+        """
+        rows: list[dict[str, Any]] = []
+        after: str | None = None
+        for _ in range(MAX_CHANNEL_PAGES):
+            payload: dict[str, Any] = {"op": "channels", "limit": page_size}
+            if after is not None:
+                payload["after"] = after
+            try:
+                response = self.request(payload)
+            except WireError as exc:
+                if after is None and exc.code == "invalid_request" and "unknown fields" in str(exc):
+                    return self.request({"op": "channels"})["channels"]
+                raise
+            page = response["channels"]
+            rows.extend(page)
+            if response.get("has_more") is not True:
+                return rows
+            next_after = response.get("next_after")
+            if not page or not isinstance(next_after, str) or (after is not None and next_after <= after):
+                raise WireError("wire server reported more channels but did not advance")
+            after = next_after
+        raise WireError(f"channel listing exceeded {MAX_CHANNEL_PAGES} pages")
 
     # ── watch: streaming notification listener ────────────────────────────
 

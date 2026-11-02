@@ -14,8 +14,10 @@ from typing import Any
 
 from .errors import AuthenticationError, ProtocolError, WireError
 from .protocol import (
+    MAX_CHANNELS_LIMIT,
     MAX_FRAME_BYTES,
     MAX_RESPONSE_FRAME_BYTES,
+    MAX_UNPAGED_CHANNELS_FRAME_BYTES,
     decode_frame,
     encode_frame,
     require_exact_keys,
@@ -31,6 +33,12 @@ from .storage import PeerCredentials, Seat, WireStore
 from .wake import MAX_WAKE_LIST_LIMIT
 
 LOG = logging.getLogger("aivengers_wire")
+
+#: Bytes the smallest possible ``channels`` row occupies in a frame (name,
+#: message_count and latest_message_id at their minimum, plus its separator).
+_MIN_CHANNEL_ROW_BYTES = len(
+    encode_frame({"channel": "a", "message_count": 1, "latest_message_id": 1})
+)
 
 
 def _fit_listing_response(
@@ -146,6 +154,49 @@ SUBSCRIBER_BUFFER_LIMIT = 262_144
 MAX_WATCH_CHANNELS = 16
 MAX_WATCH_TIMEOUT_MS = 3_600_000
 
+#: Admission of connections that have not authenticated yet.
+#:
+#: Every client sends its auth frame immediately after connecting, so a
+#: handshake takes milliseconds. A connection that has not delivered one
+#: complete, valid auth frame within AUTH_TIMEOUT_SECONDS (measured from
+#: accept, for the WHOLE frame, so drip-feeding bytes cannot extend it) is
+#: refused and closed.
+#:
+#: At most MAX_UNAUTHENTICATED_CONNECTIONS may be waiting to authenticate at
+#: once, and at most MAX_UNAUTHENTICATED_PER_PEER per kernel-reported peer
+#: PID, so one runaway or stalled process cannot take every slot from the
+#: others. Authenticated connections do not count: they are never evicted and
+#: are not subject to the deadline (a watch legitimately idles for hours).
+#:
+#: A newcomer that would exceed a limit evicts the oldest pending connection
+#: (of the same peer for the per-peer limit, otherwise overall), but only if
+#: that connection has already waited at least UNAUTH_EVICTION_GRACE_SECONDS.
+#: A still-young connection is probably a legitimate handshake that is about
+#: to complete, so then the newcomer is refused instead. Either way the
+#: affected client receives an error frame and the connection is closed.
+#: The limits sit well under the default open-file limits (1024 on Linux, 256
+#: on macOS) and above any realistic burst of simultaneous handshakes.
+AUTH_TIMEOUT_SECONDS = 10.0
+MAX_UNAUTHENTICATED_CONNECTIONS = 64
+MAX_UNAUTHENTICATED_PER_PEER = 32
+UNAUTH_EVICTION_GRACE_SECONDS = 1.0
+
+#: Longest the relay waits for a closing socket to finish flushing before it
+#: aborts the transport, so a peer that never reads cannot pin a closed
+#: connection's resources.
+CLOSE_TIMEOUT_SECONDS = 2.0
+
+#: At most one admission warning per this many seconds, however large the flood.
+ADMISSION_LOG_INTERVAL_SECONDS = 30.0
+
+
+@dataclass
+class _Pending:
+    """One connection that is still waiting to authenticate."""
+
+    pid: int
+    since: float
+
 
 @dataclass
 class _Subscription:
@@ -164,13 +215,44 @@ class _Subscription:
 
 
 class WireServer:
-    def __init__(self, store: WireStore):
+    def __init__(
+        self,
+        store: WireStore,
+        *,
+        auth_timeout: float = AUTH_TIMEOUT_SECONDS,
+        max_unauthenticated: int = MAX_UNAUTHENTICATED_CONNECTIONS,
+        max_unauthenticated_per_peer: int = MAX_UNAUTHENTICATED_PER_PEER,
+        eviction_grace: float = UNAUTH_EVICTION_GRACE_SECONDS,
+    ):
+        if auth_timeout <= 0 or eviction_grace < 0:
+            raise ValueError("auth_timeout must be positive and eviction_grace non-negative")
+        if max_unauthenticated < 1 or max_unauthenticated_per_peer < 1:
+            raise ValueError("unauthenticated connection limits must be at least 1")
         self.store = store
         self._server: asyncio.AbstractServer | None = None
+        self._auth_timeout = auth_timeout
+        self._max_unauthenticated = max_unauthenticated
+        self._max_unauthenticated_per_peer = max_unauthenticated_per_peer
+        self._eviction_grace = eviction_grace
+        # writer -> admission record, oldest first. Like ``_subscribers`` it is
+        # mutated only on the event loop thread, and each admission decision is
+        # made with no await in it, so the limits cannot be raced past.
+        self._pending: dict[Any, _Pending] = {}
+        #: Cumulative counts of connections the relay closed before they
+        #: authenticated, by cause. Observability and test hooks only.
+        self.auth_timeouts = 0
+        self.admission_evictions = 0
+        self.admission_refusals = 0
+        self._last_admission_log = float("-inf")
         # writer -> subscription. Mutated only from the event loop thread and
         # never across an await, so registration plus watermark capture is
         # atomic with respect to message persistence.
         self._subscribers: dict[Any, _Subscription] = {}
+
+    @property
+    def unauthenticated_connections(self) -> int:
+        """Connections currently waiting to authenticate."""
+        return len(self._pending)
 
     async def start(self) -> None:
         self.store.initialize()
@@ -192,11 +274,19 @@ class WireServer:
     async def close(self) -> None:
         if self._server is not None:
             self._server.close()
+            # A connection still waiting to authenticate has no work to finish.
+            # End it now: ``wait_closed`` waits for every open connection, and
+            # shutdown must not sit out a stalled client's authentication
+            # deadline.
+            for writer in list(self._pending):
+                self._refuse(writer, "wire relay is shutting down")
+            self._pending.clear()
             await self._server.wait_closed()
             self._server = None
         for writer in list(self._subscribers):
             self._unsubscribe(writer)
         self._subscribers.clear()
+        self._pending.clear()
         try:
             if self.store.socket_path.exists() and stat.S_ISSOCK(
                 self.store.socket_path.lstat().st_mode
@@ -249,6 +339,103 @@ class WireServer:
         writer.write(encode_frame(response))
         await writer.drain()
 
+    # ── admission of unauthenticated connections ─────────────────────────
+
+    def _admit(self, writer: Any, peer: PeerCredentials) -> bool:
+        """Register a new connection as pending authentication, or refuse it.
+
+        Synchronous, with no await, so concurrent accepts cannot race past a
+        limit. Returns False when the newcomer was refused; the caller then
+        just ends the connection. May evict one stale pending connection to
+        make room (see the admission notes at the top of this module).
+        """
+        now = asyncio.get_running_loop().time()
+        same_peer = [w for w, p in self._pending.items() if p.pid == peer.pid]
+        if len(same_peer) >= self._max_unauthenticated_per_peer:
+            candidate = same_peer[0]
+        elif len(self._pending) >= self._max_unauthenticated:
+            candidate = next(iter(self._pending))
+        else:
+            candidate = None
+        if candidate is not None:
+            if now - self._pending[candidate].since < self._eviction_grace:
+                self.admission_refusals += 1
+                self._note_admission_pressure("refused a new connection")
+                self._refuse(
+                    writer,
+                    "too many unauthenticated connections; retry shortly",
+                )
+                return False
+            self.admission_evictions += 1
+            self._note_admission_pressure("evicted a stalled connection")
+            del self._pending[candidate]
+            self._refuse(
+                candidate,
+                "connection closed: it had not authenticated and the relay "
+                "reached its limit of unauthenticated connections",
+            )
+        self._pending[writer] = _Pending(pid=peer.pid, since=now)
+        return True
+
+    @staticmethod
+    def _refuse(writer: Any, message: str) -> None:
+        """Queue a refusal frame and start closing, without waiting on the peer.
+
+        The frame is tiny and the socket fresh, so it fits the kernel buffer;
+        nothing here can block on a peer that never reads. The refused
+        connection's own handler wakes on the resulting EOF and ends.
+        """
+        try:
+            writer.write(
+                encode_frame({"ok": False, "error": "operation_failed", "message": message})
+            )
+        except Exception:
+            pass
+        try:
+            writer.close()
+        except Exception:  # pragma: no cover - transport already gone
+            pass
+
+    def _note_admission_pressure(self, what: str) -> None:
+        now = asyncio.get_running_loop().time()
+        if now - self._last_admission_log >= ADMISSION_LOG_INTERVAL_SECONDS:
+            self._last_admission_log = now
+            LOG.warning(
+                "unauthenticated connection limit reached: %s "
+                "(totals: auth_timeouts=%d evictions=%d refusals=%d; limit=%d, "
+                "per-peer limit=%d)",
+                what,
+                self.auth_timeouts,
+                self.admission_evictions,
+                self.admission_refusals,
+                self._max_unauthenticated,
+                self._max_unauthenticated_per_peer,
+            )
+
+    async def _read_auth_request(self, reader: asyncio.StreamReader) -> dict[str, Any] | None:
+        """Read the connection's first frame within the authentication deadline."""
+        try:
+            async with asyncio.timeout(self._auth_timeout):
+                return await self._read_request(reader)
+        except TimeoutError:
+            self.auth_timeouts += 1
+            raise AuthenticationError(
+                f"authentication was not completed within {self._auth_timeout:g} seconds"
+            ) from None
+
+    async def _close_writer(self, writer: asyncio.StreamWriter) -> None:
+        """Close the connection, aborting it if it will not flush promptly."""
+        try:
+            writer.close()
+            async with asyncio.timeout(CLOSE_TIMEOUT_SECONDS):
+                await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except TimeoutError:
+            transport = writer.transport
+            if transport is not None:
+                transport.abort()
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -256,10 +443,19 @@ class WireServer:
         seat: Seat | None = None
         try:
             peer = self._peer_credentials(writer)
-            auth = await self._read_request(reader)
+            if not self._admit(writer, peer):
+                return
+            auth = await self._read_auth_request(reader)
             if auth is None:
                 return
+            if writer not in self._pending:
+                # Evicted for room while its frame was in flight: the refusal
+                # is already on the wire and the connection is closing.
+                return
             seat = self._authenticate_request(auth)
+            # Authenticated: from here the connection no longer counts against
+            # the unauthenticated limits and is not subject to the deadline.
+            del self._pending[writer]
             await self._send(writer, {"ok": True, "seat": seat.name})
 
             while True:
@@ -316,11 +512,8 @@ class WireServer:
             await self._safe_error(writer, "internal_error", "wire operation failed")
         finally:
             self._unsubscribe(writer)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            self._pending.pop(writer, None)
+            await self._close_writer(writer)
 
     async def _flush_response(self, writer: Any, committed: dict[str, Any] | None) -> bool:
         """Await the queued response's drain; False when the connection is gone.
@@ -338,6 +531,9 @@ class WireServer:
         return True
 
     async def _safe_error(self, writer: asyncio.StreamWriter, code: str, message: str) -> None:
+        # This ends the connection: it no longer waits to authenticate, so it
+        # must not be picked for eviction while its refusal is being sent.
+        self._pending.pop(writer, None)
         try:
             await self._send(writer, {"ok": False, "error": code, "message": message})
         except (BrokenPipeError, ConnectionResetError):
@@ -441,8 +637,8 @@ class WireServer:
             )
             return {"channel": channel, "last_message_id": advanced}
         if op == "channels":
-            require_exact_keys(request, required={"op"})
-            return {"channels": self.store.list_channels()}
+            require_exact_keys(request, required={"op"}, optional={"limit", "after"})
+            return self._list_channels(request)
         if op == "watch":
             return self._handle_watch(request, seat=seat, writer=writer)
         if op == "register":
@@ -636,6 +832,55 @@ class WireServer:
                 cursor_field_b="wake_id",
             )
         raise ProtocolError(f"unsupported operation: {op!r}")
+
+    def _list_channels(self, request: dict[str, Any]) -> dict[str, Any]:
+        """The ``channels`` operation: paged on request, complete-or-refused otherwise.
+
+        A request carrying ``limit`` opts in to the paging contract shared by
+        the other listings: name-ordered keyset pages, ``after`` exclusive,
+        ``has_more`` and ``next_after`` truthful, each page trimmed to its
+        complete frame size so it fits MAX_FRAME_BYTES.
+
+        A request without ``limit`` is what every adapter shipped before
+        paging sends, and those read ``channels`` as the whole inventory.
+        Truncating it would look to them like a complete list, so it is never
+        truncated: it gets the complete listing when that fits
+        MAX_UNPAGED_CHANNELS_FRAME_BYTES (the largest response any of them
+        accepts) and a clear refusal otherwise. Either way the relay's work
+        and the frame it builds are bounded.
+        """
+        if "limit" not in request:
+            if "after" in request:
+                raise ProtocolError("after requires limit")
+            return self._list_channels_unpaged()
+        limit = validate_positive_int(request["limit"], field="limit")
+        if limit > MAX_CHANNELS_LIMIT:
+            raise ProtocolError(f"limit must not exceed {MAX_CHANNELS_LIMIT}")
+        after_value = request.get("after")
+        after = None if after_value is None else validate_name(after_value, field="after")
+        rows = self.store.list_channels(after=after, limit=limit + 1)
+        return _fit_listing_response(
+            {"channels": rows[:limit], "has_more": len(rows) > limit},
+            "channels",
+            cursor_field_a="channel",
+        )
+
+    def _list_channels_unpaged(self) -> dict[str, Any]:
+        too_large = WireError(
+            "the channel inventory is too large for one response; request it in "
+            'pages with {"op":"channels","limit":N} and continue with "after"'
+        )
+        # A row can never encode in fewer bytes than this, so more rows than
+        # fit at the minimum cannot fit at all; fetching one beyond that is
+        # all it takes to know, however large the inventory.
+        most_rows = MAX_UNPAGED_CHANNELS_FRAME_BYTES // _MIN_CHANNEL_ROW_BYTES
+        rows = self.store.list_channels(limit=most_rows + 1)
+        if len(rows) > most_rows:
+            raise too_large
+        response = {"channels": rows, "has_more": False, "next_after": None}
+        if len(encode_frame({"ok": True, **response})) > MAX_UNPAGED_CHANNELS_FRAME_BYTES:
+            raise too_large
+        return response
 
     # ── watch: authenticated real-time notification subscription ──────────
 

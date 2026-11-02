@@ -14,7 +14,7 @@ from typing import Any
 
 from .client import WireClient
 from .errors import WireError
-from .protocol import validate_name
+from .protocol import encode_frame, validate_name
 from .server import run_server
 from .storage import WireStore, format_message
 
@@ -229,7 +229,12 @@ def _message_body(value: str | None) -> str:
         return value
     if sys.stdin.isatty():
         raise WireError("message body is required when stdin is a terminal")
-    return sys.stdin.read()
+    try:
+        return sys.stdin.read()
+    except UnicodeDecodeError:
+        raise WireError(
+            "the message body on stdin is not valid UTF-8; nothing was sent"
+        ) from None
 
 
 def execute(args: argparse.Namespace) -> int:
@@ -311,13 +316,13 @@ def execute(args: argparse.Namespace) -> int:
         _emit(response if args.json else f"ready as {response['seat']}", as_json=args.json)
         return 0
     if args.command == "channels":
-        response = client.request({"op": "channels"})
+        channels = client.list_channels()
         if args.json:
-            _emit(response, as_json=True)
-        elif not response["channels"]:
+            _emit({"ok": True, "channels": channels}, as_json=True)
+        elif not channels:
             print("No channels yet.")
         else:
-            for channel in response["channels"]:
+            for channel in channels:
                 print(
                     f"#{channel['channel']}: {channel['message_count']} messages "
                     f"(latest {channel['latest_message_id']})"
@@ -340,6 +345,15 @@ def execute(args: argparse.Namespace) -> int:
             args.client_id if args.client_id is not None else f"cli-{uuid.uuid4().hex}"
         )
         payload["client_id"] = client_id
+        try:
+            encode_frame(payload)
+        except UnicodeEncodeError:
+            # Command-line bytes that are not valid UTF-8 reach Python as lone
+            # surrogates. Nothing has been sent, so there is nothing to retry.
+            raise WireError(
+                "the message text is not valid UTF-8 (an argument holds bytes or "
+                "an unpaired surrogate that cannot be encoded); nothing was sent"
+            ) from None
         try:
             response = client.request(payload)
         except WireError as exc:

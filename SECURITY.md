@@ -22,6 +22,16 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
 - Watch events never advance seat cursors; `read`/`advance` remain the only cursor mutators.
 - A listener that stops draining is disconnected once its pending outbound bytes exceed a fixed
   limit; one slow listener cannot stall the relay or grow memory without bound.
+- A connection that has not authenticated is closed after a fixed deadline for the whole
+  authentication frame, and the number of connections waiting to authenticate is capped globally and
+  per client process. A stalled or leaking process cannot hold every slot, and a connection that is
+  still within a normal handshake window is never evicted to make room. Authenticated connections do
+  not count against the caps and keep their seat binding for their lifetime.
+- Request text holding an unpaired UTF-16 surrogate, and JSON nested deeper than the parser allows,
+  are refused as `invalid_request` before any handler runs. Such input cannot reach storage, cannot
+  commit a message, and does not produce `internal_error`.
+- The `channels` operation builds a bounded response: pages of a requested size are trimmed to the
+  transport frame, and an unpaged request is answered completely or refused, never truncated.
 
 ## Not proven
 
@@ -48,6 +58,16 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
 - Watch state is per-connection. A listener that reconnects must catch up from its durable cursor
   (`read`), not from notifications; the subscription watermark exists to make that catch-up
   gap-free, not to replace it.
+- The caps above bound connections that have not authenticated. They do not bound authenticated
+  connections: a seat holder can open many, and an authenticated client that stops reading pins its
+  own pending response. Both need a token, which this model already treats as full seat access.
+- The per-process cap on unauthenticated connections keys on the PID the kernel reports. A hostile
+  process under the same Unix user can fork to use more PIDs; that is within the same-user limit
+  above, and the global cap and deadline still bound the total.
+- The relay runs synchronous SQLite calls on its event loop. A slow query, or a write waiting on a
+  database lock held by another process, delays every connection for its duration, including the
+  authentication deadline timers, which fire late. Moving database work off the event loop is a
+  separate change that needs its own design and review.
 
 ## Hardening path
 
