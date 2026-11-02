@@ -56,7 +56,7 @@ def _fit_listing_response(
     correctly shaped page — empty items, ``has_more=false``, no
     continuation cursor. Only a NON-EMPTY page trimmed down to nothing
     (a single legal row exceeding the frame budget — unreachable given
-    admission caps: max wake row ≈ 0.9 KB, max session row ≈ 13 KB,
+    admission caps: max wake row ≈ 13.5 KB with a maximal note, max session row ≈ 13 KB,
     both far below the 65,536-byte budget) is a contract violation and
     fails loudly rather than lying.
 

@@ -483,5 +483,199 @@ class StandaloneSafetyTestCase(unittest.TestCase):
             self.assertEqual(store.socket_path.read_text(encoding="utf-8"), "do not delete me")
 
 
+def run_wire_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run the real ``wire`` entry point in a subprocess (no relay needed)."""
+    project_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project_root / "src")
+    env.pop("AIVENGERS_WIRE_STATE_DIR", None)
+    return subprocess.run(
+        [sys.executable, "-m", "aivengers_wire", *args],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+class CliOperatorErrorTestCase(unittest.TestCase):
+    """Operator mistakes surface as one ``wire: ...`` line, never a traceback."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.state_dir = self.root / "state"
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def assertCleanRefusal(self, proc: subprocess.CompletedProcess[str], needle: str) -> None:
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertTrue(proc.stderr.startswith("wire: "), proc.stderr)
+        self.assertIn(needle, proc.stderr)
+
+    def test_task_add_rejects_invalid_scope_json(self) -> None:
+        proc = run_wire_cli(
+            "--state-dir", str(self.state_dir),
+            "task", "add", "t2", "--title", "x", "--scope", "not-json",
+        )
+        self.assertCleanRefusal(proc, "--scope must be valid JSON")
+        self.assertIsNone(WireStore(self.state_dir).get_task("t2"))
+        # A valid non-object is still refused with its own message.
+        proc = run_wire_cli(
+            "--state-dir", str(self.state_dir),
+            "task", "add", "t2", "--title", "x", "--scope", "[1]",
+        )
+        self.assertCleanRefusal(proc, "--scope must be a JSON object")
+
+    def test_seat_add_refuses_orphaned_token_file(self) -> None:
+        store = WireStore(self.state_dir)
+        store.initialize()
+        orphan = store.seat_dir / "carol.token"
+        orphan.write_text("someone-elses-token\n", encoding="utf-8")
+        proc = run_wire_cli("--state-dir", str(self.state_dir), "seat", "add", "carol")
+        self.assertCleanRefusal(proc, str(orphan))
+        self.assertIn("remove that orphaned file", proc.stderr)
+        # Never overwritten, never adopted.
+        self.assertEqual(orphan.read_text(encoding="utf-8"), "someone-elses-token\n")
+        with store.connect() as conn:
+            row = conn.execute("SELECT 1 FROM seats WHERE name = 'carol'").fetchone()
+        self.assertIsNone(row)
+        # Once the operator removes it, the seat can be added normally.
+        orphan.unlink()
+        proc = run_wire_cli("--state-dir", str(self.state_dir), "seat", "add", "carol")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_init_refuses_existing_foreign_directory_without_chmod(self) -> None:
+        shared = self.root / "shared"
+        shared.mkdir()
+        os.chmod(shared, 0o755)
+        (shared / "notes.txt").write_text("team notes", encoding="utf-8")
+        proc = run_wire_cli("--state-dir", str(shared), "init")
+        self.assertCleanRefusal(proc, "does not look like a Wire state dir")
+        self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o755)
+        self.assertEqual(sorted(p.name for p in shared.iterdir()), ["notes.txt"])
+
+    def test_init_refuses_a_file_as_state_dir(self) -> None:
+        not_a_dir = self.root / "file"
+        not_a_dir.write_text("x", encoding="utf-8")
+        proc = run_wire_cli("--state-dir", str(not_a_dir), "init")
+        self.assertCleanRefusal(proc, "is not a directory")
+
+    def test_init_adopts_empty_dir_and_reinitializes_wire_dir(self) -> None:
+        empty = self.root / "empty"
+        empty.mkdir()
+        os.chmod(empty, 0o755)
+        proc = run_wire_cli("--state-dir", str(empty), "init", "--seat", "alice")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(stat.S_IMODE(empty.stat().st_mode), 0o700)
+        # An existing Wire state dir (wire.db present) re-initializes, even
+        # with extra files an operator or integration left beside it.
+        (empty / "operator-notes.txt").write_text("keep", encoding="utf-8")
+        proc = run_wire_cli("--state-dir", str(empty), "seat", "add", "bob")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((empty / "operator-notes.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_store_initialize_refuses_foreign_directory(self) -> None:
+        shared = self.root / "shared"
+        shared.mkdir()
+        (shared / "something").mkdir()
+        with self.assertRaisesRegex(WireError, "does not look like a Wire state dir"):
+            WireStore(shared).initialize()
+        self.assertFalse((shared / "wire.db").exists())
+        self.assertFalse((shared / "seats").exists())
+
+    def test_clubhouse_shares_the_cli_state_dir_resolution(self) -> None:
+        from aivengers_wire import cli, clubhouse
+
+        self.assertIs(clubhouse.default_state_dir, cli.default_state_dir)
+
+
+class ClientTransportErrorTestCase(unittest.TestCase):
+    """Socket failures on the way to or from the relay become ``WireError``.
+
+    A plain listening socket stands in for the relay so ``connect`` succeeds;
+    the failure under test is injected at the step where it really happens
+    (connect for PermissionError, write for BrokenPipeError, read for
+    ConnectionResetError).
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.store = WireStore(Path(self.temp_dir.name) / "state")
+        self.store.initialize()
+        self.store.add_seat("tech")
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.store.socket_path))
+        self.listener.listen(16)
+        self.client = WireClient(self.store, seat="tech")
+
+    def tearDown(self) -> None:
+        self.listener.close()
+        self.temp_dir.cleanup()
+
+    def cases(self):
+        return (
+            (
+                "permission",
+                mock.patch.object(
+                    socket.socket, "connect",
+                    side_effect=PermissionError(13, "Permission denied"),
+                ),
+                PermissionError,
+                "permission denied reaching wire server",
+            ),
+            (
+                "broken-pipe",
+                mock.patch.object(
+                    WireClient, "_write", side_effect=BrokenPipeError(32, "Broken pipe")
+                ),
+                BrokenPipeError,
+                "lost connection to wire server",
+            ),
+            (
+                "reset",
+                mock.patch.object(
+                    WireClient, "_read",
+                    side_effect=ConnectionResetError(104, "Connection reset by peer"),
+                ),
+                ConnectionResetError,
+                "lost connection to wire server",
+            ),
+        )
+
+    def test_request_wraps_socket_failures(self) -> None:
+        for name, patcher, cause, needle in self.cases():
+            with self.subTest(name), patcher:
+                with self.assertRaises(WireError) as ctx:
+                    self.client.request({"op": "ping"})
+                self.assertIn(needle, str(ctx.exception))
+                self.assertIn(str(self.store.socket_path), str(ctx.exception))
+                self.assertIsInstance(ctx.exception.__cause__, cause)
+
+    def test_watch_wraps_socket_failures(self) -> None:
+        for name, patcher, cause, needle in self.cases():
+            with self.subTest(name), patcher:
+                with self.assertRaises(WireError) as ctx:
+                    next(self.client.watch(timeout_ms=100))
+                self.assertIn(needle, str(ctx.exception))
+                self.assertIsInstance(ctx.exception.__cause__, cause)
+
+    def test_cli_reports_lost_connection_without_traceback(self) -> None:
+        stderr = io.StringIO()
+        from aivengers_wire import cli
+
+        with mock.patch.object(
+            WireClient, "_read", side_effect=ConnectionResetError(104, "reset")
+        ), mock.patch("sys.stderr", stderr):
+            code = cli.main(
+                ["--state-dir", str(self.store.state_dir), "ping", "--seat", "tech"]
+            )
+        self.assertEqual(code, 2)
+        self.assertTrue(stderr.getvalue().startswith("wire: lost connection"), stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

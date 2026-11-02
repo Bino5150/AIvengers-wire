@@ -28,6 +28,7 @@ import sqlite3
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -639,6 +640,143 @@ class WakeW0Tests(RunningWireTestCase):
                 session_id=session["session_id"],
                 outcome="completed",
             )
+
+    # ── completion fencing: only a current claimant may report ────────────
+
+    def _claimed(self, task_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        session, wake = self._wake_for_session(task_id)
+        claimed = self.client("tech").claim(
+            wake_id=wake["wake_id"], session_id=session["session_id"]
+        )
+        self.assertEqual(claimed["fencing"]["session_generation"], 1)
+        return session, claimed
+
+    def test_complete_refused_after_claimant_unregisters(self) -> None:
+        session, claimed = self._claimed("T-F1")
+        retired = self.client("tech").unregister_session(
+            session_id=session["session_id"]
+        )
+        self.assertEqual(retired["generation"], 2)
+        with self.assertRaises(WireError) as ctx:
+            self.client("tech").complete(
+                task_ref="T-F1",
+                session_id=session["session_id"],
+                outcome="completed",
+            )
+        self.assertIn("offline", str(ctx.exception))
+        # The refusal wrote nothing: the task is still held by the retired
+        # claimant (visible to the operator) and the wake is still claimed.
+        task = self.store.get_task("T-F1")
+        self.assertEqual(task["state"], "claimed")
+        self.assertIsNone(task["completed_at"])
+        self.assertEqual(
+            self.store.get_wake(claimed["wake"]["wake_id"])["state"], "claimed"
+        )
+        # The operator can still clear the stranded claim.
+        self.assertEqual(
+            self.store.cancel_task(task_id="T-F1", reason="claimant retired")["state"],
+            "cancelled",
+        )
+
+    def test_complete_refused_on_lapsed_lease_until_heartbeat(self) -> None:
+        session, claimed = self._claimed("T-F2")
+        with self.store.connect() as conn:
+            conn.execute(
+                "UPDATE wire_sessions SET lease_expires_at='2000-01-01T00:00:00Z' "
+                "WHERE session_id=?",
+                (session["session_id"],),
+            )
+        with self.assertRaises(WireError) as ctx:
+            self.client("tech").complete(
+                task_ref="T-F2",
+                session_id=session["session_id"],
+                outcome="completed",
+            )
+        self.assertIn("lease expired", str(ctx.exception))
+        self.assertEqual(self.store.get_task("T-F2")["state"], "claimed")
+        # A session that was never retired recovers by renewing its lease.
+        self.client("tech").heartbeat_session(session_id=session["session_id"])
+        done = self.client("tech").complete(
+            task_ref="T-F2", session_id=session["session_id"], outcome="completed"
+        )
+        self.assertEqual(done["task"]["state"], "completed")
+        self.assertEqual(done["wake"]["state"], "completed")
+
+    def test_draining_session_may_still_complete_claimed_work(self) -> None:
+        session, _ = self._claimed("T-F3")
+        self.client("tech").heartbeat_session(
+            session_id=session["session_id"], state="draining"
+        )
+        done = self.client("tech").complete(
+            task_ref="T-F3", session_id=session["session_id"], outcome="failed"
+        )
+        self.assertEqual(done["task"]["state"], "failed")
+
+    # ── wake note: stored with the intent, never silently dropped ─────────
+
+    def test_wake_note_is_persisted_and_visible_to_target(self) -> None:
+        session = self.client("tech").register_session(adapter="test-fake")
+        self.store.add_task(task_id="T-N1", title="t")
+        receipt = self.client("bino").wake(
+            target_seat="tech",
+            task_ref="T-N1",
+            target_session_id=session["session_id"],
+            note="  please look  ",
+        )
+        wake_id = receipt["wake"]["wake_id"]
+        self.assertEqual(receipt["wake"]["note"], "please look")
+        self.assertEqual(self.client("tech").wake_status(wake_id=wake_id)["note"], "please look")
+        listed = self.client("tech").wake_list(state="pending")
+        self.assertEqual([w["note"] for w in listed], ["please look"])
+        # The bound watcher receives the note in its catch-up wake frame.
+        sock, stream, ack = wake_socket(
+            self.store, "tech", {"op": "watch", "session_id": session["session_id"]}
+        )
+        try:
+            self.assertTrue(ack["ok"], ack)
+            frame = json.loads(recv_line(sock, 5.0))
+            self.assertEqual(frame["event"], "wake")
+            self.assertEqual(frame["wake"]["note"], "please look")
+        finally:
+            stream.close()
+            sock.close()
+
+    def test_wake_without_note_records_null_and_bad_notes_are_refused(self) -> None:
+        self.store.add_task(task_id="T-N2", title="t")
+        receipt = self.client("bino").wake(target_seat="tech", task_ref="T-N2")
+        self.assertIn("note", receipt["wake"])
+        self.assertIsNone(receipt["wake"]["note"])
+        for bad in ("   ", "x" * (wake_module.MAX_NOTE_CHARS + 1)):
+            with self.subTest(length=len(bad)):
+                with self.assertRaises(WireError):
+                    self.client("bino").wake(
+                        target_seat="tech", task_ref="T-N2", note=bad
+                    )
+
+    def test_cli_wake_note_round_trips(self) -> None:
+        """The original reproduction: ``wire --json wake ... --note`` used to
+        return a wake record with no note."""
+        self.store.add_task(task_id="t1", title="t")
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "aivengers_wire",
+                "--state-dir", str(self.state_dir), "--json",
+                "wake", "--seat", "bino", "--target-seat", "tech",
+                "--task", "t1", "--note", "please look",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        receipt = json.loads(proc.stdout)
+        self.assertEqual(receipt["wake"]["note"], "please look")
+        stored = self.store.get_wake(receipt["wake"]["wake_id"])
+        self.assertEqual(stored["note"], "please look")
 
     # ── catch-up, restart, expiry, observability ──────────────────────────
 
@@ -1325,6 +1463,53 @@ class GoblinReviewRegressions(RunningWireTestCase):
                 wake_id=w["wake_id"], session_id=s["session_id"]
             )
         self.assertEqual(self.store.get_task("T")["state"], "open")
+
+
+class WakeNoteMigrationTests(unittest.TestCase):
+    """A store whose ``wire_wakes`` predates the ``note`` column gains it via
+    the guarded ALTER in ``initialize_wake_tables``; legacy rows read back
+    with ``note: null`` and new wakes keep their note."""
+
+    def test_initialize_adds_note_column_to_legacy_store(self) -> None:
+        legacy_sql = wake_module.WAKE_SCHEMA_SQL.replace("    note TEXT,\n", "", 1)
+        self.assertNotEqual(legacy_sql, wake_module.WAKE_SCHEMA_SQL)
+        with tempfile.TemporaryDirectory() as temp:
+            store = WireStore(Path(temp) / "state")
+            store.state_dir.mkdir(mode=0o700)
+            legacy = sqlite3.connect(store.db_path)
+            try:
+                legacy.executescript(legacy_sql)
+                legacy.execute(
+                    """
+                    INSERT INTO wire_wakes(
+                        wake_id, target_seat, task_ref, requested_by,
+                        state, created_at
+                    ) VALUES ('legacy', 'tech', 'T-OLD', 'bino', 'pending',
+                              '2026-01-01T00:00:00.000000Z')
+                    """
+                )
+                legacy.commit()
+                columns = {row[1] for row in legacy.execute("PRAGMA table_info(wire_wakes)")}
+                self.assertNotIn("note", columns)
+            finally:
+                legacy.close()
+
+            store.initialize()
+            store.add_seat("tech")
+            store.add_seat("bino")
+            store.add_task(task_id="T-NEW", title="t")
+            self.assertIsNone(store.get_wake("legacy")["note"])
+            wake, _, _ = store.request_wake(
+                requester=Seat("bino", False),
+                target_seat="tech",
+                task_ref="T-NEW",
+                note="please look",
+            )
+            self.assertEqual(wake["note"], "please look")
+            self.assertEqual(store.get_wake(wake["wake_id"])["note"], "please look")
+            # Re-initializing an already migrated store is a no-op.
+            store.initialize()
+            self.assertEqual(store.get_wake(wake["wake_id"])["note"], "please look")
 
 
 if __name__ == "__main__":  # pragma: no cover

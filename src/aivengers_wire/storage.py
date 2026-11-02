@@ -19,6 +19,14 @@ from .wake import WakeStoreMixin
 
 SCHEMA_VERSION = 1
 
+#: Names Wire itself creates directly inside a state directory. A pre-existing
+#: directory is adopted (and locked down to 0700) only if it holds a
+#: ``wire.db`` or nothing but these names; anything else is treated as
+#: someone else's folder and refused rather than silently chmod-ed.
+WIRE_STATE_ENTRIES = frozenset(
+    {"wire.db", "wire.db-wal", "wire.db-shm", "wire.db-journal", "seats", "wire.sock"}
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -56,7 +64,36 @@ class WireStore(WakeStoreMixin):
         self.seat_dir = state_dir / "seats"
         self.socket_path = state_dir / "wire.sock"
 
+    def _check_state_dir_is_ours(self) -> None:
+        """Refuse to adopt a pre-existing directory that is not a Wire state dir.
+
+        ``initialize`` locks the state directory down to 0700. Pointing
+        ``--state-dir`` / ``AIVENGERS_WIRE_STATE_DIR`` at an existing shared
+        folder (a home directory, a project checkout) must not silently
+        revoke everyone else's access to it, so a directory that already
+        exists is accepted only when it is empty, holds a ``wire.db``, or
+        holds nothing but entries Wire itself creates.
+        """
+        path = self.state_dir
+        if not path.exists() and not path.is_symlink():
+            return
+        if not path.is_dir():
+            raise WireError(f"state dir {path} exists and is not a directory")
+        try:
+            entries = {entry.name for entry in path.iterdir()}
+        except OSError as exc:
+            raise WireError(f"cannot inspect state dir {path}: {exc}") from exc
+        if "wire.db" in entries or entries <= WIRE_STATE_ENTRIES:
+            return
+        raise WireError(
+            f"refusing to initialize Wire state in {path}: the directory already "
+            "exists, is not empty and has no wire.db, so it does not look like a "
+            "Wire state dir (initializing would chmod it to 0700); point "
+            "--state-dir or AIVENGERS_WIRE_STATE_DIR at an empty or dedicated directory"
+        )
+
     def initialize(self) -> None:
+        self._check_state_dir_is_ours()
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.state_dir, 0o700)
         self.seat_dir.mkdir(mode=0o700, exist_ok=True)
@@ -165,7 +202,18 @@ class WireStore(WakeStoreMixin):
 
             token = secrets.token_urlsafe(32)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            fd = os.open(token_path, flags, 0o600)
+            try:
+                fd = os.open(token_path, flags, 0o600)
+            except FileExistsError as exc:
+                # No seat row, yet a token file is already there: a leftover
+                # from a deleted database or a manual copy. Never overwrite
+                # it (it may be someone's live credential) and never adopt
+                # it (its digest is not on record).
+                raise WireError(
+                    f"seat {name!r} has no database record but its token file "
+                    f"{token_path} already exists; remove that orphaned file or "
+                    "move it aside, then add the seat again"
+                ) from exc
             try:
                 os.write(fd, (token + "\n").encode("utf-8"))
                 os.fsync(fd)
