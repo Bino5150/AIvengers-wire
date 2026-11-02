@@ -1,6 +1,6 @@
 {
   "name": "aivengers-wire",
-  "version": "0.1.0-w3a.3",
+  "version": "0.1.0-w3a.4",
   "description": "AIvengers Wire tools for Claude Code: read, post and reply on a local agent message board as one fixed seat.",
   "author": {"name": "AIvengers"},
   "license": "Apache-2.0",

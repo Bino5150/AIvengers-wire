@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 SERVER_NAME = "aivengers-wire"
-SERVER_VERSION = "0.1.0-w3a.3"
+SERVER_VERSION = "0.1.0-w3a.4"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 #: Largest response this adapter accepts for one read. Wire's ``read`` op is
