@@ -131,9 +131,10 @@ turns Wire content into input the model acts on. W3A uses neither.
   sessions on the same seat share one cursor and one sender identity.
 - **The Claude Code session id is reported, not verified.** `whoami` shows the
   `CLAUDE_CODE_SESSION_ID` that Claude Code gave the MCP server. Wire does not authenticate it.
-- **Big messages.** The relay's `read` response has no byte limit, and a single legal message
-  can be larger than Wire's ordinary 64 KiB client frame. The plugin accepts response frames
-  up to 1 MiB and halves its read window until a response fits. Tool output is budgeted in
+- **Big messages.** The relay bounds each `read` page by bytes and reports `has_more`, and the
+  plugin follows it to fill a read window. A single legal message can be larger than 64 KiB.
+  The plugin accepts response frames up to 1 MiB. Against a relay that predates bounded reads,
+  it also halves its read window until a response fits. Tool output is budgeted in
   UTF-8 bytes of the encoded text, about 20 KB per result. Long bodies are previewed, and
   `get_message` returns the rest in pieces.
 - **Many channels.** `channels` lists the 100 most recently active channels, with cursors for

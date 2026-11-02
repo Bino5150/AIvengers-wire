@@ -412,9 +412,12 @@ class BoundedReadTests(AdapterTestCase):
         alice = self.adapter("alice")
         bob = self.adapter("bob")
         ids = [alice.call("post", {"channel": "big", "body": chr(65 + n) * 30_000})["id"] for n in range(3)]
-        # The finding: Wire's ordinary client cannot read this window at all.
-        with self.assertRaisesRegex(WireError, "exceeds maximum frame size"):
-            WireClient(self.store, seat="bob").request({"op": "read", "channel": "big", "after": 0, "limit": 3})
+        # The relay bounds the page by bytes: Wire's own client gets a truthful partial page.
+        page = WireClient(self.store, seat="bob").request({"op": "read", "channel": "big", "after": 0, "limit": 3})
+        self.assertLessEqual(len(encode_frame(page)), MAX_FRAME_BYTES)
+        self.assertEqual([row["id"] for row in page["messages"]], ids[:2])
+        self.assertEqual((page["has_more"], page["next_after"]), (True, ids[1]))
+        # The adapter follows the continuation to fill its window.
         result = bob.call("read", {"channel": "big", "limit": 3})
         self.assertEqual([row["id"] for row in result["messages"]], ids)
         self.assertFalse(result["has_more"])
@@ -422,7 +425,7 @@ class BoundedReadTests(AdapterTestCase):
             self.assertTrue(row["body_truncated"])
             self.assertEqual(row["body_chars"], 30_000)
 
-    def test_single_legal_message_unreadable_by_plain_client_is_fetched_whole(self) -> None:
+    def test_single_legal_message_over_64_kib_is_posted_and_fetched_whole(self) -> None:
         alice = self.adapter("alice")
         bob = self.adapter("bob")
         # The largest body whose post request (as the adapter sends it, with a
@@ -430,14 +433,14 @@ class BoundedReadTests(AdapterTestCase):
         # characters escape to six JSON bytes each.
         empty = encode_frame({"op": "post", "channel": "big", "body": "", "client_id": "cc-" + "0" * 32})
         body = "\x01" * ((MAX_FRAME_BYTES - len(empty)) // 6)
-        # Plain client: the post persists, but its echoed response overflows,
-        # so the caller is told it failed.
-        with self.assertRaisesRegex(WireError, "exceeds maximum frame size"):
-            WireClient(self.store, seat="alice").request({"op": "post", "channel": "big", "body": body})
+        # Plain client: the echoed response is over 64 KiB but within the
+        # relay's response bound, so the caller learns the post succeeded.
+        plain = WireClient(self.store, seat="alice").request({"op": "post", "channel": "big", "body": body})
+        self.assertGreater(len(encode_frame(plain)), MAX_FRAME_BYTES)
         self.assertEqual(self.count("messages"), 1)
-        # Plain client: even limit=1 overflows, so the message cannot be read.
-        with self.assertRaisesRegex(WireError, "exceeds maximum frame size"):
-            WireClient(self.store, seat="bob").request({"op": "read", "channel": "big", "after": 0, "limit": 1})
+        # Plain client: the one message reads whole with limit=1.
+        read = WireClient(self.store, seat="bob").request({"op": "read", "channel": "big", "after": 0, "limit": 1})
+        self.assertEqual(read["messages"][0]["body"], body)
         # Adapter: the same post succeeds truthfully, and the message reads whole.
         posted = alice.call("post", {"channel": "big", "body": body})
         self.assertFalse(posted["duplicate"])
@@ -746,11 +749,11 @@ class NoticeHookTests(AdapterTestCase):
         result = self.hook("bob", event, CLAUDE_PLUGIN_DATA=str(blocked))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("unread peer messages in 32 channels (checked the 32 most recently active of 40 channels)", result.stdout)
-        # Enough channels to overflow Wire's ordinary 64 KiB client frame.
+        # An unpaged channel inventory larger than 64 KiB.
         for n in range(560):
             poster.request({"op": "post", "channel": f"c{n:03d}-" + "x" * 56, "body": "x"})
-        with self.assertRaisesRegex(WireError, "exceeds maximum frame size"):
-            WireClient(self.store, seat="bob").request({"op": "channels"})
+        inventory = BoundedWireClient(self.store, seat="bob").request({"op": "channels"})
+        self.assertGreater(len(encode_frame(inventory)), MAX_FRAME_BYTES)
         crowded = self.hook("bob", {"hook_event_name": "SessionStart", "source": "startup", "session_id": "s"})
         self.assertIn("of 600 channels", crowded.stdout)
 
@@ -1099,6 +1102,26 @@ class ReadWindowUnitTests(unittest.TestCase):
         adapter.request = request  # type: ignore[method-assign]
         window, more = adapter.read_window("general", 0, 8)
         self.assertEqual((requested, [row["id"] for row in window], more), ([9, 4], [1, 2, 3, 4], True))
+        window, more = adapter.read_window("general", 8, 8)
+        self.assertEqual(([row["id"] for row in window], more), ([9, 10], False))
+
+    def test_pages_trimmed_by_a_bounded_relay_are_followed(self) -> None:
+        module = load_server_module()
+        rows = [{"id": n} for n in range(1, 11)]
+        requested: list[tuple[int, int]] = []
+
+        def request(payload: dict) -> dict:
+            requested.append((payload["after"], payload["limit"]))
+            rest = [row for row in rows if row["id"] > payload["after"]]
+            page = rest[: min(payload["limit"], 3)]  # the relay trims every page to 3 rows
+            more = len(rest) > len(page)
+            return {"messages": page, "has_more": more, "next_after": page[-1]["id"] if more else None}
+
+        adapter = module.WireAdapter()
+        adapter.request = request  # type: ignore[method-assign]
+        window, more = adapter.read_window("general", 0, 8)
+        self.assertEqual([row["id"] for row in window], [1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual((more, requested), (True, [(0, 9), (3, 6), (6, 3)]))
         window, more = adapter.read_window("general", 8, 8)
         self.assertEqual(([row["id"] for row in window], more), ([9, 10], False))
 

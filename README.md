@@ -45,13 +45,14 @@ This installs two console commands: `wire` (relay + client CLI) and `clubhouse`
 (optional Tkinter GUI). Importing the package has no side effects: it creates no
 state, starts no services, and touches no network.
 
-Clubhouse reads history in pages, reducing the requested page size when long
-messages exceed the client's 64 KiB response-frame limit. It preserves complete
-messages, their order and provenance, and does not advance seat cursors. Each
-refresh loads at most 2,000 messages and continues from the last loaded ID on the
-next refresh. If even one message cannot fit, it reports an error rather than
-skipping or truncating it. This client-side repair works with an already running
-relay; close and reopen Clubhouse to load an updated GUI client.
+Clubhouse reads history in pages and follows the relay's `has_more` (see
+[Message size and frame limits](#message-size-and-frame-limits)). It preserves
+complete messages, their order and provenance, and does not advance seat cursors.
+Each refresh loads at most 2,000 messages and continues from the last loaded ID on
+the next refresh. Against a relay that predates bounded reads, it halves the
+requested page size when a response is too large; if even one message cannot fit,
+it reports an error rather than skipping or truncating it. Close and reopen
+Clubhouse to load an updated GUI client.
 
 History uses a read-only native scrolling text area, so long histories and tall
 individual messages remain reachable without overlapping native message frames.
@@ -97,8 +98,8 @@ wire init [--seat NAME ...] [--demo-roster]
 wire seat add NAME [--can-forward]
 wire serve
 wire ping --seat NAME
-wire post --seat NAME CHANNEL [BODY]
-wire reply --seat NAME CHANNEL MESSAGE_ID [BODY]
+wire post --seat NAME CHANNEL [BODY] [--client-id ID]
+wire reply --seat NAME CHANNEL MESSAGE_ID [BODY] [--client-id ID]
 wire read --seat NAME CHANNEL [--after ID] [--limit N] [--advance]
 wire cursor --seat NAME CHANNEL
 wire advance --seat NAME CHANNEL MESSAGE_ID
@@ -107,6 +108,36 @@ wire watch --seat NAME [--channel NAME ...] [--timeout-ms N]
 ```
 
 If `BODY` is omitted, `post` and `reply` read it from standard input.
+
+## Message size and frame limits
+
+- **Requests** are at most 65,536 bytes per frame (`MAX_FRAME_BYTES`), newline
+  included. A body is at most 32,768 characters and must also fit that frame, so
+  non-ASCII bodies hold fewer characters.
+- **Responses and `watch` events** are at most 131,072 bytes per frame
+  (`MAX_RESPONSE_FRAME_BYTES`), and the core client accepts exactly that much. This
+  covers the largest legal message. Its text arrived in one request of at most
+  64 KiB, and the relay never encodes a string in more bytes than it took to send.
+  The fields the relay adds (id, uuid, seat, timestamp, peer credentials and the
+  frame envelope) take under 1 KiB. So a stored post always gets its full echo back,
+  and `read` and `watch` can always deliver any single message.
+- **`read` pages are byte-bounded.** The relay trims trailing messages until the
+  complete page fits 65,536 bytes, but never below one message. A page that holds one
+  large message may use the 128 KiB response bound. Every page reports `has_more`
+  and `next_after`: the id to pass as `after`, or `null` when nothing remains. The
+  `messages` key is unchanged, so clients built with a 64 KiB cap keep working,
+  except on a single message over 64 KiB.
+- **`wire read`** follows `next_after` until it has shown `--limit` messages. If
+  more remain, it ends with `-- more messages after ID; continue with --after ID`.
+  With `--advance`, run it again instead.
+- **`wire post` and `wire reply`** send a generated `client_id` (`cli-…`) unless
+  you pass `--client-id`. If a post fails, the CLI prints the `client_id` it used.
+  Run the same command again with `--client-id ID` to retry safely. The relay stores
+  each seat's `client_id` at most once and answers a repeat with the stored message,
+  and the CLI then prints `-- already stored …`.
+
+`channels` is not paged, so a very large channel inventory can still exceed the
+response bound.
 
 ## Real-time notifications
 

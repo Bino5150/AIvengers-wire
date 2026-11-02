@@ -39,12 +39,11 @@ SERVER_NAME = "aivengers-wire"
 SERVER_VERSION = "0.1.0-w3a.4"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
-#: Largest response this adapter accepts for one read. Wire's ``read`` op is
-#: not byte-bounded server-side, and its envelope adds fields to what was
-#: posted, so even one legal message can exceed the ordinary 65,536-byte
-#: client frame. A stored message came through a request frame of at most
-#: 65,536 bytes, so its read frame stays well under this cap; larger windows
-#: are halved until they fit.
+#: Largest response this adapter accepts. A current relay never sends more
+#: than ``MAX_RESPONSE_FRAME_BYTES`` (128 KiB): it trims ``read`` pages and
+#: reports ``has_more``, and one legal message always fits. Relays that
+#: predate bounded reads send unbounded ``read`` pages, so this adapter keeps
+#: a larger cap and halves a window that does not fit it.
 READ_FRAME_CAP = 1_048_576
 
 MAX_READ_LIMIT = 20
@@ -227,7 +226,8 @@ class WireAdapter:
 
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
         # Every op uses the larger cap: a post's response echoes the stored
-        # message, which can itself exceed 65,536 bytes after a successful post.
+        # message, which can itself exceed 65,536 bytes after a successful post
+        # (the core client now accepts that too; older relays' reads need more).
         client = self.client()
         try:
             return client.request(payload)
@@ -279,25 +279,41 @@ class WireAdapter:
     def read_window(self, channel: str, after: int, want: int) -> tuple[list[dict[str, Any]], bool]:
         """Up to ``want`` messages after ``after``, plus an honest has-more flag.
 
-        Fetches one sentinel row. If the relay's (unbounded) response does not
-        fit the frame cap, the window is halved; one message always fits.
+        Fetches one sentinel row. A current relay bounds each page by bytes
+        and reports ``has_more``, so a trimmed page is followed from its last
+        id until ``want`` rows arrive. A relay that predates bounded reads
+        reports no ``has_more`` and may send a response over the frame cap;
+        then the window is halved, and one message always fits.
         """
-        limit = want + 1
+        rows: list[dict[str, Any]] = []
         while True:
-            try:
-                response = self.request(
-                    {"op": "read", "channel": channel, "after": after, "limit": limit}
-                )
-            except ToolError as exc:
-                if exc.kind == "frame_too_large" and limit > 1:
-                    limit = max(1, limit // 2)
-                    continue
-                raise
-            rows = response["messages"]
-            if len(rows) > want:
-                return rows[:want], True
-            # A reduced window that came back full may have more behind it.
-            return rows, len(rows) == limit and limit <= want
+            remaining = want - len(rows)
+            limit = remaining + 1
+            while True:
+                try:
+                    response = self.request(
+                        {"op": "read", "channel": channel, "after": after, "limit": limit}
+                    )
+                except ToolError as exc:
+                    if exc.kind == "frame_too_large" and limit > 1:
+                        limit = max(1, limit // 2)
+                        continue
+                    raise
+                break
+            page = response["messages"]
+            if len(page) > remaining:
+                return rows + page[:remaining], True
+            rows.extend(page)
+            relay_more = response.get("has_more")
+            if not isinstance(relay_more, bool):
+                # An older relay: a reduced window that came back full may
+                # have more behind it.
+                return rows, len(page) == limit and limit <= remaining
+            if relay_more and not page:
+                raise ToolError("bad_response", "wire server reported more messages but returned none")
+            if not relay_more or len(rows) == want:
+                return rows, relay_more
+            after = page[-1]["id"]
 
 
 # ── output shaping ───────────────────────────────────────────────────────

@@ -174,6 +174,32 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertEqual(got,ids)
         self.assertEqual(self.b.call("wire_cursor",{"channel":"general"})["last_message_id"],0)
 
+    def test_window_follows_pages_trimmed_by_a_bounded_relay(self):
+        rows=[{"id":n,"channel":"general","body":"x"} for n in range(1,11)]
+        calls=[]
+        def request(payload,**_):
+            calls.append((payload["after"],payload["limit"]))
+            rest=[r for r in rows if r["id"]>payload["after"]];page=rest[:min(payload["limit"],3)]
+            more=len(rest)>len(page)
+            return {"ok":True,"messages":page,"has_more":more,"next_after":page[-1]["id"] if more else None}
+        with patch.object(self.b.transport,"request",side_effect=request):
+            got,more=self.b._window("general",0,8)
+            self.assertEqual(([r["id"] for r in got],more),([1,2,3,4,5,6,7,8],True))
+            self.assertEqual(calls,[(0,9),(3,6),(6,3)])
+            got,more=self.b._window("general",8,8)
+            self.assertEqual(([r["id"] for r in got],more),([9,10],False))
+
+    def test_window_from_an_older_relay_still_halves_and_infers_has_more(self):
+        rows=[{"id":n,"channel":"general","body":"x"} for n in range(1,11)]
+        limits=[]
+        def request(payload,**_):
+            limits.append(payload["limit"])
+            if payload["limit"]>4:raise AdapterError("response_too_large","bounded")
+            return {"ok":True,"messages":[r for r in rows if r["id"]>payload["after"]][:payload["limit"]]}
+        with patch.object(self.b.transport,"request",side_effect=request):
+            got,more=self.b._window("general",0,8)
+        self.assertEqual(([r["id"] for r in got],more,limits),([1,2,3],True,[9,4]))
+
     def test_exact_get_never_returns_a_different_message(self):
         m=self.post()
         self.error("not_found",self.b.call,"wire_get",{"message_id":m["id"]+1})

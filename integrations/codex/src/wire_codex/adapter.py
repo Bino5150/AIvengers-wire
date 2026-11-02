@@ -15,8 +15,10 @@ from aivengers_wire.protocol import (
 )
 from aivengers_wire.storage import load_token
 
-# Temporary W0 response workaround. Legal 32,768-character bodies can encode
-# to ~197 KiB. The request limit and the core client's limit remain unchanged.
+# A current relay sends at most 128 KiB per response: it trims read pages,
+# reports has_more, and one legal message always fits. Relays that predate
+# bounded reads send unbounded pages, so this bound stays above 128 KiB and
+# read batches still shrink on overflow. The request limit is unchanged.
 RESPONSE_BYTES = 262_144
 RESULT_BYTES = 48_000
 SLICE_BYTES = 4_096
@@ -225,20 +227,22 @@ class Adapter:
         while len(self.delivered) > MAX_TRACKED:
             self.delivered.popitem(last=False)
 
-    def _window(self, channel: str | None, after: int, limit: int) -> tuple[list[dict[str, Any]], bool]:
-        n = limit + 1
+    def _page(self, channel: str | None, after: int, n: int) -> tuple[list[dict[str, Any]], bool | None, int]:
+        """One validated read page: rows, the relay's has_more (None if not reported), and the limit used."""
         while True:
             payload = {"op": "read", "after": after, "limit": n}
             if channel is not None:
                 payload["channel"] = channel
             try:
-                rows = self.transport.request(payload)["messages"]
+                response = self.transport.request(payload)
+                rows = response["messages"]
                 break
             except AdapterError as exc:
                 if exc.payload["error"] != "response_too_large" or n == 1:
                     raise
                 n = max(1, n // 2)
-        if not isinstance(rows, list) or len(rows) > n:
+        more = response.get("has_more")
+        if not isinstance(rows, list) or len(rows) > n or (more is not None and type(more) is not bool):
             raise AdapterError("invalid_response", "Wire returned an invalid message page.")
         prev = after
         for row in rows:
@@ -247,6 +251,27 @@ class Adapter:
                     or not isinstance(row.get("body"), str)):
                 raise AdapterError("invalid_response", "Wire returned an invalid message page.")
             prev = row["id"]
+        if more and not rows:
+            raise AdapterError("invalid_response", "Wire returned an invalid message page.")
+        return rows, more, n
+
+    def _window(self, channel: str | None, after: int, limit: int) -> tuple[list[dict[str, Any]], bool]:
+        got: list[dict[str, Any]] = []
+        while True:
+            want = limit - len(got)
+            rows, more, n = self._page(channel, after, want + 1)
+            if len(rows) > want:
+                return got + rows[:want], True
+            if more is not None:
+                # A byte-bounded relay trims pages and reports has_more
+                # truthfully; follow it until the window is full.
+                got += rows
+                if not more or len(got) == limit:
+                    return got, more
+                after = rows[-1]["id"]
+                continue
+            break
+        # A relay that predates bounded reads: infer has_more from the sentinel.
         if len(rows) < n:
             return rows, False
         if n > 1:

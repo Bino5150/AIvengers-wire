@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,12 @@ DEMO_ROSTER: tuple[tuple[str, bool], ...] = (
     ("goblin", False),
     ("other-claude", False),
     ("bino-gateway", True),
+)
+
+
+CLIENT_ID_HELP = (
+    "idempotency key; generated when omitted. Retrying with the same key never "
+    "stores the message twice"
 )
 
 
@@ -107,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("body", nargs="?", help="message body, or read stdin when omitted")
     post.add_argument("--reply-to", type=int)
     post.add_argument("--forwarded-for")
-    post.add_argument("--client-id")
+    post.add_argument("--client-id", help=CLIENT_ID_HELP)
 
     reply = subparsers.add_parser("reply", help="reply to an existing message")
     _add_client_options(reply)
@@ -115,13 +122,18 @@ def build_parser() -> argparse.ArgumentParser:
     reply.add_argument("reply_to", type=int)
     reply.add_argument("body", nargs="?", help="message body, or read stdin when omitted")
     reply.add_argument("--forwarded-for")
-    reply.add_argument("--client-id")
+    reply.add_argument("--client-id", help=CLIENT_ID_HELP)
 
     read = subparsers.add_parser("read", help="read messages in canonical ID order")
     _add_client_options(read)
     read.add_argument("channel")
     read.add_argument("--after", type=int, help="override the seat's saved cursor")
-    read.add_argument("--limit", type=int, default=50)
+    read.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="most messages to show; pages the relay trims for size are followed",
+    )
     read.add_argument("--advance", action="store_true", help="advance cursor after a successful read")
 
     cursor = subparsers.add_parser("cursor", help="show the seat's channel cursor")
@@ -319,12 +331,29 @@ def execute(args: argparse.Namespace) -> int:
             payload["reply_to"] = reply_to
         if args.forwarded_for is not None:
             payload["forwarded_for"] = args.forwarded_for
-        if args.client_id is not None:
-            payload["client_id"] = args.client_id
-        response = client.request(payload)
-        _emit(
-            response if args.json else format_message(response["message"]), as_json=args.json
+        # Always send a client_id, so retrying a post whose outcome is unclear
+        # (lost response, timeout) can never store it twice.
+        client_id = (
+            args.client_id if args.client_id is not None else f"cli-{uuid.uuid4().hex}"
         )
+        payload["client_id"] = client_id
+        try:
+            response = client.request(payload)
+        except WireError as exc:
+            print(f"wire: {exc}", file=sys.stderr)
+            print(
+                f"wire: this {args.command} used client_id {client_id}. If it may have "
+                f"been stored, run the same command again with --client-id {client_id}: "
+                "the relay never stores one client_id twice.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.json:
+            _emit(response, as_json=True)
+        else:
+            print(format_message(response["message"]))
+            if response["message"].get("duplicate"):
+                print(f"-- already stored with client_id {client_id}; not stored again")
         return 0
     if args.command == "cursor":
         response = client.request({"op": "cursor", "channel": args.channel})
@@ -345,10 +374,10 @@ def execute(args: argparse.Namespace) -> int:
         if after is None:
             cursor_response = client.request({"op": "cursor", "channel": args.channel})
             after = cursor_response["last_message_id"]
-        response = client.request(
-            {"op": "read", "channel": args.channel, "after": after, "limit": args.limit}
-        )
-        messages = response["messages"]
+        # The relay trims pages to fit its response frame; follow its
+        # continuation until --limit messages have arrived.
+        result = client.read_messages(channel=args.channel, after=after, limit=args.limit)
+        messages = result["messages"]
         if args.advance and messages:
             client.request(
                 {
@@ -358,11 +387,23 @@ def execute(args: argparse.Namespace) -> int:
                 }
             )
         if args.json:
-            _emit(response, as_json=True)
-        elif not messages:
+            _emit({"ok": True, **result}, as_json=True)
+            return 0
+        if not messages:
             print("No new messages.")
         else:
             print("\n".join(format_message(message) for message in messages))
+        if result["has_more"]:
+            if args.advance:
+                print(
+                    f"-- more messages after {result['next_after']}; "
+                    "the cursor advanced, run again to continue"
+                )
+            else:
+                print(
+                    f"-- more messages after {result['next_after']}; "
+                    f"continue with --after {result['next_after']}"
+                )
         return 0
     if args.command == "watch":
         client = _client(args, store)

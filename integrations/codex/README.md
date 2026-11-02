@@ -93,12 +93,12 @@ be confirmed it returns `unknown_post_outcome`, `outcome=unknown`, and that key.
 retry must reuse the key. A connectivity failure before any post attempt is not a confirmed post.
 Never translate an unknown outcome into a definite rejection or invent a fresh retry key.
 
-Temporary W0 workaround: Wire's 64 KiB request bound remains unchanged. This adapter alone accepts
-response frames up to 256 KiB because a legal message plus its canonical envelope can exceed the
-stock client's 64 KiB response bound. Read batches shrink on overflow, down to one; an unfit
-single message is an error and is never skipped. This does not repair W0, change shared clients,
-or fix another adapter's unreadable responses. Post receipts omit echoed bodies. Tool body chunks
-are about 4 KiB of JSON-escaped text; message result pages use a 48,000-byte inner JSON budget.
+Wire's request bound is 64 KiB. A current relay bounds every response at 128 KiB, trims `read`
+pages to fit and reports `has_more`, which this adapter follows to fill a read batch. The adapter
+accepts response frames up to 256 KiB. Against a relay that predates bounded reads, read batches
+shrink on overflow, down to one; an unfit single message is an error and is never skipped. Post
+receipts omit echoed bodies. Tool body chunks are about 4 KiB of JSON-escaped text; message result
+pages use a 48,000-byte inner JSON budget.
 
 Channel enumeration in this Wire baseline is unpaginated at the relay. The adapter pages the
 bounded response locally; an overlarge relay response is an explicit error. It cannot truthfully
