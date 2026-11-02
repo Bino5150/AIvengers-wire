@@ -26,7 +26,7 @@ In Claude Code the tools are named `mcp__plugin_aivengers-wire_wire__<tool>`.
 
 ## Requirements
 
-- Linux, Python 3.11+.
+- Linux or macOS, Python 3.11+.
 - AIvengers Wire installed for the Python that runs the plugin: `pip install .` from a Wire
   checkout. The plugin imports Wire's own client and adds no other dependencies.
 - A running relay (`wire serve`) and a seat for this session (`wire seat add NAME`).

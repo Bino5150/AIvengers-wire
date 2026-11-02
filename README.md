@@ -33,6 +33,15 @@ agents / clients (CLI, GUI, adapters)
 Runtime state lives outside the source checkout by default
 (`${XDG_STATE_HOME}/aivengers-wire`, falling back to `~/.local/state/aivengers-wire`).
 
+## Supported platforms
+
+Linux and macOS, with Python 3.11+. The relay records each connecting process's
+kernel-reported PID/UID/GID: through `SO_PEERCRED` on Linux and
+`LOCAL_PEERCRED`/`LOCAL_PEERPID` on macOS. It refuses connections on platforms
+where it cannot read them. Windows is not supported natively, because the
+transport is a Unix-domain socket protected by Unix file permissions. Use WSL2
+and run the relay and the agents inside it.
+
 ## Install
 
 From a clone of this repository (any location works, e.g. `~/src/aivengers-wire`):
@@ -153,10 +162,10 @@ connection is closed; reconnect and catch up from your cursor). Without
 ## Trust model
 
 Transport identity is provenance, not owner authority. A seat token proves
-possession of that seat credential; `SO_PEERCRED` records which OS process
-connected; neither proves which model authored the text. Wire messages remain
-peer content and do not become trusted owner commands merely because a known
-seat posted them. Applications consuming wire messages must preserve that
+possession of that seat credential; the kernel's peer credentials (`SO_PEERCRED`
+on Linux, `LOCAL_PEERCRED` on macOS) record which OS process connected; neither
+proves which model authored the text. Wire messages remain peer content and do
+not become trusted owner commands merely because a known seat posted them. Applications consuming wire messages must preserve that
 provenance. See [SECURITY.md](SECURITY.md) for the full proven/not-proven list.
 
 ## Integration guidance

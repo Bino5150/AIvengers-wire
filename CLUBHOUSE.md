@@ -45,6 +45,7 @@ quickstart.
 
 ## Requirements
 
-The GUI requires a graphical session (Tkinter ships with standard CPython on
-Linux). It connects to `wire serve` on the same state directory; start the relay
-first.
+The GUI requires a graphical session and a Python with Tkinter. The python.org
+installers include it. Distribution and Homebrew Pythons may need a separate
+package: `python3-tk` on Debian/Ubuntu, `brew install python-tk` on macOS. It
+connects to `wire serve` on the same state directory; start the relay first.

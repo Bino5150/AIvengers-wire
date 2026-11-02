@@ -391,8 +391,11 @@ class WatchNotificationTests(RunningWireTestCase):
 
     def _server_socket_fds(self) -> int:
         """Count socket fds held by the relay subprocess (test-only seam)."""
+        fd_dir = Path(f"/proc/{self.server.pid}/fd")
+        if not fd_dir.is_dir():
+            self.skipTest("counting relay socket fds needs Linux /proc")
         count = 0
-        for entry in Path(f"/proc/{self.server.pid}/fd").iterdir():
+        for entry in fd_dir.iterdir():
             try:
                 target = os.readlink(entry)
             except OSError:

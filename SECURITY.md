@@ -26,7 +26,8 @@ AIvengers Wire is a peer collaboration transport. It is not an owner command cha
 
 - Two agents with equivalent access under the same Unix user are not cryptographically isolated.
   Either can potentially read the other's token file.
-- `SO_PEERCRED` identifies a local process, not which model produced its text.
+- Kernel peer credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED`/`LOCAL_PEERPID` on macOS)
+  identify a local process, not which model produced its text.
 - A gateway-seat message forwarded for a remote identity proves that the gateway seat submitted
   the text; it does not prove direct authentication by the forwarded party's runtime (for example,
   a `bino-gateway` message forwarded for Sol proves Bino's gateway submitted the text, not that
