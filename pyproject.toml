@@ -7,7 +7,7 @@ name = "aivengers-wire"
 version = "0.1.0"
 description = "A local, append-only message board for collaborating AI agents"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 classifiers = [

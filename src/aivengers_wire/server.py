@@ -8,7 +8,6 @@ import logging
 import os
 import socket
 import stat
-import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,7 @@ from typing import Any
 from .errors import AuthenticationError, ProtocolError, WireError
 from .protocol import (
     MAX_FRAME_BYTES,
+    MAX_RESPONSE_FRAME_BYTES,
     decode_frame,
     encode_frame,
     require_exact_keys,
@@ -26,6 +26,7 @@ from .protocol import (
     validate_positive_int,
     validate_read_limit,
 )
+from .peercred import peer_credentials
 from .storage import PeerCredentials, Seat, WireStore
 from .wake import MAX_WAKE_LIST_LIMIT
 
@@ -37,8 +38,9 @@ def _fit_listing_response(
     rows_key: str,
     *,
     cursor_field_a: str,
-    cursor_field_b: str,
+    cursor_field_b: str | None = None,
     budget: int = MAX_FRAME_BYTES,
+    single_row_budget: int | None = None,
 ) -> dict[str, Any]:
     """Bound a listing response by its ACTUAL FINAL transport size.
 
@@ -56,7 +58,7 @@ def _fit_listing_response(
     correctly shaped page — empty items, ``has_more=false``, no
     continuation cursor. Only a NON-EMPTY page trimmed down to nothing
     (a single legal row exceeding the frame budget — unreachable given
-    admission caps: max wake row ≈ 0.9 KB, max session row ≈ 13 KB,
+    admission caps: max wake row ≈ 13.5 KB with a maximal note, max session row ≈ 13 KB,
     both far below the 65,536-byte budget) is a contract violation and
     fails loudly rather than lying.
 
@@ -65,17 +67,31 @@ def _fit_listing_response(
     dropped, and the cursor always names the last INCLUDED row, so a
     consumer walking pages can never loop forever (the cursor advances
     or ``has_more`` goes false).
+
+    ``cursor_field_b=None`` makes ``next_after`` the scalar
+    ``cursor_field_a`` of the last included row (``read`` uses the message
+    id, which callers pass back as ``after``) instead of a two-field keyset.
+
+    ``single_row_budget`` (``read``): the page is never trimmed below one
+    row, and a page of exactly one row may use this larger budget. Every
+    legal stored message fits MAX_RESPONSE_FRAME_BYTES (see protocol.py), so
+    ``read`` can always return the next message, while pages of several
+    messages still fit ``budget``.
     """
     rows = response[rows_key]
     started_empty = not rows
+    keep = 0 if single_row_budget is None else 1
 
     def _refresh_cursor() -> None:
         if response["has_more"] and rows:
             last = rows[-1]
-            response["next_after"] = {
-                cursor_field_a: last[cursor_field_a],
-                cursor_field_b: last[cursor_field_b],
-            }
+            if cursor_field_b is None:
+                response["next_after"] = last[cursor_field_a]
+            else:
+                response["next_after"] = {
+                    cursor_field_a: last[cursor_field_a],
+                    cursor_field_b: last[cursor_field_b],
+                }
         else:
             response["next_after"] = None
 
@@ -84,15 +100,37 @@ def _fit_listing_response(
         # ordinary client actually reads and bounds-checks.
         return len(encode_frame({"ok": True, **response}))
 
+    # Pre-trim in one linear pass. Each row encodes the same inside the list
+    # as on its own, so once the rows alone (plus their separating commas)
+    # pass the budget, no page holding them can fit, whatever the envelope.
+    # This drops only rows the exact loop below would drop too, and spares it
+    # from re-encoding a multi-megabyte page once per trimmed row.
+    used = 0
+    for index, row in enumerate(rows):
+        used += len(encode_frame(row)) - 1 + (1 if index else 0)
+        if used > budget and index >= keep:
+            del rows[index:]
+            response["has_more"] = True
+            break
+
     # Cursor metadata exists BEFORE the first size measurement (R3-B).
     _refresh_cursor()
-    while rows and _wire_bytes() > budget:
+    while len(rows) > keep and _wire_bytes() > budget:
         rows.pop()
         response["has_more"] = True
         _refresh_cursor()
     if not rows and not started_empty:
         raise WireError(
             "listing response cannot fit the transport frame budget; "
+            "this indicates an admission-cap contract violation"
+        )
+    if (
+        len(rows) == 1
+        and single_row_budget is not None
+        and _wire_bytes() > max(budget, single_row_budget)
+    ):
+        raise WireError(
+            "a single stored row cannot fit the response frame bound; "
             "this indicates an admission-cap contract violation"
         )
     return response
@@ -191,13 +229,9 @@ class WireServer:
     @staticmethod
     def _peer_credentials(writer: asyncio.StreamWriter) -> PeerCredentials:
         peer_socket = writer.get_extra_info("socket")
-        if peer_socket is None or not hasattr(socket, "SO_PEERCRED"):
+        if peer_socket is None:
             raise WireError("Unix peer credentials are unavailable")
-        raw = peer_socket.getsockopt(
-            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
-        )
-        pid, uid, gid = struct.unpack("3i", raw)
-        return PeerCredentials(pid=pid, uid=uid, gid=gid)
+        return peer_credentials(peer_socket)
 
     async def _read_request(self, reader: asyncio.StreamReader) -> dict[str, Any] | None:
         try:
@@ -377,11 +411,19 @@ class WireServer:
             )
             after = validate_nonnegative_int(request["after"], field="after")
             limit = validate_read_limit(request["limit"])
-            return {
-                "messages": self.store.read_messages(
-                    channel=channel, after=after, limit=limit
-                )
-            }
+            # One sentinel row beyond the limit makes has_more truthful at
+            # the limit. The page is then bounded by its complete transport
+            # frame like the other listings: trailing messages are trimmed
+            # (never below one, which always fits the response bound) and
+            # stay reachable through next_after. ``messages`` keeps its shape;
+            # has_more and next_after are additive for older clients.
+            rows = self.store.read_messages(channel=channel, after=after, limit=limit + 1)
+            return _fit_listing_response(
+                {"messages": rows[:limit], "has_more": len(rows) > limit},
+                "messages",
+                cursor_field_a="id",
+                single_row_budget=MAX_RESPONSE_FRAME_BYTES,
+            )
         if op == "cursor":
             require_exact_keys(request, required={"op", "channel"})
             channel = validate_name(request["channel"], field="channel")
@@ -819,6 +861,21 @@ class WireServer:
         stays pending until its adapter acks, so an overflow or disconnect
         here loses nothing: unwritten wakes remain pending and replay on the
         next subscription. Marking must never outrun writing.
+
+        Flow control: wakes can carry a ``note`` of up to
+        :data:`~aivengers_wire.wake.MAX_NOTE_CHARS` characters (≈ 13.5 KB per
+        frame), so a full batch is ≈ 430 KB — more than
+        SUBSCRIBER_BUFFER_LIMIT. Written as one synchronous burst, a socket
+        with a small kernel send buffer (macOS defaults to 8 KiB for Unix
+        stream sockets) overflowed and dropped a healthy watcher mid-replay,
+        every reconnect. Each accepted write is therefore followed by this
+        connection's own ``drain()``: replay advances at the watcher's read
+        pace, only this watcher's handler waits, and the buffer-limit drop
+        stays as the backstop for live fanout. Because the drain yields to
+        the loop, each later wake is re-checked first — the watch may have
+        timed out or been dropped (replay stops; the rest stay pending), and
+        the wake may have been acknowledged, claimed, cancelled or expired
+        meanwhile (it is skipped instead of replayed as stale ``pending``).
         """
 
         subscription = self._subscribers.get(writer)
@@ -828,7 +885,14 @@ class WireServer:
             seat=seat.name, session_id=subscription.session_id
         )
         written = 0
-        for wake in wakes:
+        for index, wake in enumerate(wakes):
+            if index:
+                if self._subscribers.get(writer) is not subscription:
+                    break
+                current = self.store.get_wake(wake["wake_id"])
+                if current is None or current["state"] != "pending":
+                    continue
+                wake = current
             frame = encode_frame({"ok": True, "event": "wake", "wake": wake})
             transport = writer.transport
             buffered = 0 if transport is None else transport.get_write_buffer_size()
@@ -844,6 +908,10 @@ class WireServer:
             # durable state is untouched (pending until wake_ack).
             self.store.record_wake_attempt(wake["wake_id"])
             written += 1
+            try:
+                await writer.drain()
+            except (ConnectionError, RuntimeError):
+                break  # Connection gone; the rest stay pending for replay.
         if written:
             LOG.info(
                 "pending wakes transmitted seat=%r count=%d", seat.name, written

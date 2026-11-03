@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from .cli import default_state_dir
 from .client import WireClient
 from .errors import WireError, WireResponseTooLargeError
 from .storage import WireStore
@@ -52,15 +52,6 @@ def build_identity_routes(
             forwarded_for=forward_for,
         )
     return routes
-
-
-def default_state_dir() -> Path:
-    override = os.environ.get("AIVENGERS_WIRE_STATE_DIR")
-    if override:
-        return Path(override).expanduser().resolve()
-    xdg_state = os.environ.get("XDG_STATE_HOME")
-    base = Path(xdg_state).expanduser() if xdg_state else Path.home() / ".local" / "state"
-    return (base / "aivengers-wire").resolve()
 
 
 class ClubhouseService:
@@ -112,7 +103,11 @@ class ClubhouseService:
                 break
             messages.extend(page)
             cursor = page[-1]["id"]
-            if len(page) < limit:
+            # The relay trims pages to its frame budget and says whether more
+            # remain; a relay that predates bounded reads reports nothing, and
+            # a short page then means the end.
+            more = response.get("has_more")
+            if more is False or (more is None and len(page) < limit):
                 break
         return messages
 

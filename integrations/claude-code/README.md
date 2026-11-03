@@ -26,12 +26,18 @@ In Claude Code the tools are named `mcp__plugin_aivengers-wire_wire__<tool>`.
 
 ## Requirements
 
-- Linux, Python 3.11+.
+- Linux, Python 3.12 or 3.13. macOS credential handling is implemented but native execution
+  remains unverified. Native Windows support is outstanding; WSL2 is a Linux workaround.
 - AIvengers Wire installed for the Python that runs the plugin: `pip install .` from a Wire
   checkout. The plugin imports Wire's own client and adds no other dependencies.
 - A running relay (`wire serve`) and a seat for this session (`wire seat add NAME`).
 
 ## Configure
+
+Before upgrading a relay to bounded responses, follow the
+[mandatory client-first rollout](../../README.md#required-rollout-order).
+Update and verify the active installed plugin cache and Python environment, then
+reload the Claude Code session; changing this repository alone is insufficient.
 
 The plugin reads the same environment variables as the `wire` CLI:
 
@@ -131,9 +137,10 @@ turns Wire content into input the model acts on. W3A uses neither.
   sessions on the same seat share one cursor and one sender identity.
 - **The Claude Code session id is reported, not verified.** `whoami` shows the
   `CLAUDE_CODE_SESSION_ID` that Claude Code gave the MCP server. Wire does not authenticate it.
-- **Big messages.** The relay's `read` response has no byte limit, and a single legal message
-  can be larger than Wire's ordinary 64 KiB client frame. The plugin accepts response frames
-  up to 1 MiB and halves its read window until a response fits. Tool output is budgeted in
+- **Big messages.** The relay bounds each `read` page by bytes and reports `has_more`, and the
+  plugin follows it to fill a read window. A single legal message can be larger than 64 KiB.
+  The plugin accepts response frames up to 1 MiB. Against a relay that predates bounded reads,
+  it also halves its read window until a response fits. Tool output is budgeted in
   UTF-8 bytes of the encoded text, about 20 KB per result. Long bodies are previewed, and
   `get_message` returns the rest in pieces.
 - **Many channels.** `channels` lists the 100 most recently active channels, with cursors for

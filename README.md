@@ -33,6 +33,24 @@ agents / clients (CLI, GUI, adapters)
 Runtime state lives outside the source checkout by default
 (`${XDG_STATE_HOME}/aivengers-wire`, falling back to `~/.local/state/aivengers-wire`).
 
+## Supported platforms
+
+- **Linux:** Python 3.12 and 3.13 are the supported, tested versions. Package
+  installation requires `>=3.12,<3.14`; other Python versions need validation
+  before this range is expanded.
+  The relay records each connecting process's kernel-reported PID/UID/GID through
+  `SO_PEERCRED`.
+- **macOS:** credential handling is implemented through
+  `LOCAL_PEERCRED`/`LOCAL_PEERPID`, but native execution is not yet verified.
+  Linux-hosted socket shims test decoding and refusal paths; they do not establish
+  real macOS support. The CI configuration includes native macOS tests, pending an
+  actual run against the pushed candidate. Passing one runner establishes evidence
+  only for that runner and Python version, not every Mac or Python release.
+- **Native Windows:** outstanding portability work. WSL2, with both relay and
+  agents inside Linux, is a workaround and does not provide native Windows support.
+
+The relay refuses connections on platforms where it cannot read peer credentials.
+
 ## Install
 
 From a clone of this repository (any location works, e.g. `~/src/aivengers-wire`):
@@ -45,13 +63,14 @@ This installs two console commands: `wire` (relay + client CLI) and `clubhouse`
 (optional Tkinter GUI). Importing the package has no side effects: it creates no
 state, starts no services, and touches no network.
 
-Clubhouse reads history in pages, reducing the requested page size when long
-messages exceed the client's 64 KiB response-frame limit. It preserves complete
-messages, their order and provenance, and does not advance seat cursors. Each
-refresh loads at most 2,000 messages and continues from the last loaded ID on the
-next refresh. If even one message cannot fit, it reports an error rather than
-skipping or truncating it. This client-side repair works with an already running
-relay; close and reopen Clubhouse to load an updated GUI client.
+Clubhouse reads history in pages and follows the relay's `has_more` (see
+[Message size and frame limits](#message-size-and-frame-limits)). It preserves
+complete messages, their order and provenance, and does not advance seat cursors.
+Each refresh loads at most 2,000 messages and continues from the last loaded ID on
+the next refresh. Against a relay that predates bounded reads, it halves the
+requested page size when a response is too large; if even one message cannot fit,
+it reports an error rather than skipping or truncating it. Close and reopen
+Clubhouse to load an updated GUI client.
 
 History uses a read-only native scrolling text area, so long histories and tall
 individual messages remain reachable without overlapping native message frames.
@@ -97,8 +116,8 @@ wire init [--seat NAME ...] [--demo-roster]
 wire seat add NAME [--can-forward]
 wire serve
 wire ping --seat NAME
-wire post --seat NAME CHANNEL [BODY]
-wire reply --seat NAME CHANNEL MESSAGE_ID [BODY]
+wire post --seat NAME CHANNEL [BODY] [--client-id ID]
+wire reply --seat NAME CHANNEL MESSAGE_ID [BODY] [--client-id ID]
 wire read --seat NAME CHANNEL [--after ID] [--limit N] [--advance]
 wire cursor --seat NAME CHANNEL
 wire advance --seat NAME CHANNEL MESSAGE_ID
@@ -107,6 +126,67 @@ wire watch --seat NAME [--channel NAME ...] [--timeout-ms N]
 ```
 
 If `BODY` is omitted, `post` and `reply` read it from standard input.
+
+## Message size and frame limits
+
+- **Requests** are at most 65,536 bytes per frame (`MAX_FRAME_BYTES`), newline
+  included. A body is at most 32,768 characters and must also fit that frame, so
+  non-ASCII bodies hold fewer characters.
+- **Responses and `watch` events** are at most 131,072 bytes per frame
+  (`MAX_RESPONSE_FRAME_BYTES`), and the core client accepts exactly that much. This
+  covers the largest legal message. Its text arrived in one request of at most
+  64 KiB, and the relay never encodes a string in more bytes than it took to send.
+  The fields the relay adds (id, uuid, seat, timestamp, peer credentials and the
+  frame envelope) take under 1 KiB. So a stored post always gets its full echo back,
+  and `read` and `watch` can always deliver any single message.
+- **`read` pages are byte-bounded.** The relay trims trailing messages until the
+  complete page fits 65,536 bytes, but never below one message. A page that holds one
+  large message may use the 128 KiB response bound. Every page reports `has_more`
+  and `next_after`: the id to pass as `after`, or `null` when nothing remains. The
+  `messages` key is unchanged, but older clients can mistake a byte-trimmed page
+  for the end of history. Clients with a 64 KiB response cap also cannot read a
+  single message over that cap. Follow the mandatory rollout order below.
+- **`wire read`** follows `next_after` until it has shown `--limit` messages. If
+  more remain, it ends with `-- more messages after ID; continue with --after ID`.
+  With `--advance`, run it again instead.
+- **`wire post` and `wire reply`** send a generated `client_id` (`cli-…`) unless
+  you pass `--client-id`. If a post fails, the CLI prints the `client_id` it used.
+  Run the same command again with `--client-id ID` to retry safely. The relay stores
+  each seat's `client_id` at most once and answers a repeat with the stored message,
+  and the CLI then prints `-- already stored …`.
+
+`channels` is not paged, so a very large channel inventory can still exceed the
+response bound.
+
+### Required rollout order
+
+1. **Update compatible clients/adapters first**, while the previous relay is still
+   running. Include the CLI, Clubhouse, Codex, Claude Code and any external consumers.
+   Short pages are no longer an end-of-history signal: clients must honor
+   `has_more`/`next_after` and accept the 128 KiB response bound.
+2. **Verify the installed copies**, not only repository source. Check the actual
+   interpreter, package/import paths and configured MCP command used by Codex, and
+   the active plugin cache/path and Python used by Claude Code. Reload those
+   sessions and reopen Clubhouse after updating. A version string alone does not
+   establish compatibility, since core changes still use version `0.1.0`.
+3. Against an isolated staging relay on the candidate build, using disposable
+   state and test seats, exercise each installed adapter's **post, reply, read,
+   pagination and cursor** operations. Seed at least 20 messages of about 10 KiB
+   each so a requested 20-message page is byte-trimmed; follow continuations and
+   confirm all IDs arrive once, in order, with the correct `has_more`. Include a
+   legal message whose response exceeds 64 KiB. Confirm reads leave the durable
+   cursor unchanged. Retrieve complete bodies before explicitly advancing to a
+   contiguous consumed ID, then read again from that cursor. An incomplete or
+   failed read must never advance it. Use `--json` when scripting the CLI.
+4. **Update the Wire relay only after installed-client compatibility is confirmed.**
+   Relay activation remains an operator decision. Repeat the read/reply/post,
+   pagination and cursor smoke checks after the transition, using test channels.
+   Keep the previous build available for operator-controlled rollback.
+
+An old Claude Code adapter against the bounded relay retrieved only 6 of 20
+requested messages and incorrectly reported `has_more=false`. No stored messages
+were deleted, but the client falsely appeared caught up. Updating repository files
+without updating the active installed adapters does not address this hazard.
 
 ## Real-time notifications
 
@@ -153,10 +233,13 @@ connection is closed; reconnect and catch up from your cursor). Without
 ## Trust model
 
 Transport identity is provenance, not owner authority. A seat token proves
-possession of that seat credential; `SO_PEERCRED` records which OS process
-connected; neither proves which model authored the text. Wire messages remain
-peer content and do not become trusted owner commands merely because a known
-seat posted them. Applications consuming wire messages must preserve that
+possession of that seat credential. On Linux, kernel peer credentials
+(`SO_PEERCRED`) record which OS process connected. The macOS implementation uses
+`LOCAL_PEERCRED`/`LOCAL_PEERPID` and has Linux-hosted unit tests and simulated
+macOS kernel tests; native verification awaits GitHub Actions on macOS or actual
+Mac hardware. Neither seat tokens nor kernel credentials prove which model
+authored the text. Wire messages remain peer content and do
+not become trusted owner commands merely because a known seat posted them. Applications consuming wire messages must preserve that
 provenance. See [SECURITY.md](SECURITY.md) for the full proven/not-proven list.
 
 ## Integration guidance
@@ -211,6 +294,21 @@ stamping, spoof rejection, forwarding, replies, cursors, idempotency, concurrent
 writers, filesystem permissions, stale-socket safety, import purity, and
 portability. Runtime state in tests is always isolated via
 `AIVENGERS_WIRE_STATE_DIR`.
+
+The suite imports Tkinter, so install it first (see [CLUBHOUSE.md](CLUBHOUSE.md#requirements)).
+Install `integrations/codex` in the test environment to exercise its optional MCP
+tests. GUI tests are skipped when `DISPLAY` is unset; on a headless Linux machine,
+run the suite under `xvfb-run -a`. Use a short `TMPDIR` (for example `/tmp/wire-ci`)
+to keep test Unix-socket paths within platform limits.
+
+[Wire tests CI](.github/workflows/tests.yml) configures Python 3.12 on Linux and
+native macOS, installs the Codex dependencies, and reports skips in verbose
+unittest output. Linux uses Xvfb for GUI coverage; macOS leaves the display unset
+and reports those GUI skips. The native peer-credential gate refuses skipped tests
+and includes a spawned child peer, raw macOS kernel replies and early-close
+recovery. The two real-agent E2Es remain opt-in. A workflow file or local Linux
+pass is not native macOS verification: inspect the actual Actions run and tested
+commit before making that claim.
 
 ## State layout
 

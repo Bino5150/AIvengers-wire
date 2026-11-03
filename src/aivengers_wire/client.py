@@ -8,8 +8,20 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .errors import WireError, WireResponseTooLargeError
-from .protocol import MAX_FRAME_BYTES, encode_frame, validate_name
+from .protocol import MAX_RESPONSE_FRAME_BYTES, encode_frame, validate_name
 from .storage import WireStore, load_token
+
+#: Socket failures a request or watch can hit on the way to, or while talking
+#: to, the relay. Each is reported as a ``WireError`` (with the original
+#: exception chained as ``__cause__``) instead of escaping as a traceback.
+TRANSPORT_ERRORS: tuple[type[OSError], ...] = (
+    FileNotFoundError,
+    PermissionError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    BrokenPipeError,
+    socket.timeout,
+)
 
 
 class WireClient:
@@ -34,23 +46,44 @@ class WireClient:
                 if not response.get("ok"):
                     raise WireError(response.get("message", "wire operation failed"))
                 return response
-        except FileNotFoundError as exc:
-            raise WireError(f"wire server is not running at {self.store.socket_path}") from exc
-        except (ConnectionRefusedError, socket.timeout) as exc:
-            raise WireError(f"cannot reach wire server at {self.store.socket_path}: {exc}") from exc
+        except TRANSPORT_ERRORS as exc:
+            raise self._transport_error(exc) from exc
         finally:
             sock.close()
 
+    def _transport_error(self, exc: OSError) -> WireError:
+        path = self.store.socket_path
+        if isinstance(exc, FileNotFoundError):
+            return WireError(f"wire server is not running at {path}")
+        if isinstance(exc, PermissionError):
+            return WireError(f"permission denied reaching wire server at {path}: {exc}")
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            return WireError(f"lost connection to wire server at {path}: {exc}")
+        return WireError(f"cannot reach wire server at {path}: {exc}")
+
     @staticmethod
     def _write(stream: Any, payload: dict[str, Any]) -> None:
-        stream.write(encode_frame(payload))
+        # An unbuffered socket file's write() is a single send(), which may
+        # take only part of the frame when the kernel send buffer is small
+        # (macOS gives Unix sockets 8 KiB). Keep writing until the whole
+        # frame is out; otherwise the relay waits forever for the rest of
+        # the line and the request times out.
+        frame = memoryview(encode_frame(payload))
+        while frame:
+            sent = stream.write(frame)
+            if sent is None:
+                raise socket.timeout("timed out writing to the wire server")
+            frame = frame[sent:]
 
     @staticmethod
     def _read(stream: Any) -> dict[str, Any]:
-        raw = stream.readline(MAX_FRAME_BYTES + 1)
+        # Responses are bounded by MAX_RESPONSE_FRAME_BYTES, not the request
+        # bound: the response to any legal post, and any single stored
+        # message, fits it (see protocol.py).
+        raw = stream.readline(MAX_RESPONSE_FRAME_BYTES + 1)
         if not raw:
             raise WireError("wire server closed the connection without a response")
-        if len(raw) > MAX_FRAME_BYTES:
+        if len(raw) > MAX_RESPONSE_FRAME_BYTES:
             raise WireResponseTooLargeError("wire server response exceeds maximum frame size")
         try:
             response = json.loads(raw.decode("utf-8"))
@@ -59,6 +92,47 @@ class WireClient:
         if not isinstance(response, dict):
             raise WireError("wire server returned a non-object response")
         return response
+
+    def read_messages(
+        self, *, channel: str | None, after: int, limit: int
+    ) -> dict[str, Any]:
+        """Read up to ``limit`` messages after ``after``, following continuations.
+
+        The relay bounds each ``read`` page by bytes and reports ``has_more``
+        and ``next_after``; this keeps reading from the last returned id until
+        ``limit`` messages have arrived or none remain. The first request
+        carries ``limit`` unchanged, so the relay validates it as before.
+
+        Returns ``{"messages": [...], "has_more": ..., "next_after": ...}``.
+        ``next_after`` is the id to pass as ``after`` to continue, or None
+        when nothing remains. ``has_more`` is None when the relay predates
+        bounded reads (it reports no ``has_more``); then only one page is read.
+        """
+        messages: list[dict[str, Any]] = []
+        while True:
+            payload: dict[str, Any] = {
+                "op": "read",
+                "after": after,
+                "limit": limit - len(messages),
+            }
+            if channel is not None:
+                payload["channel"] = channel
+            response = self.request(payload)
+            page = response["messages"]
+            messages.extend(page)
+            has_more = response.get("has_more")
+            if not isinstance(has_more, bool):
+                return {"messages": messages, "has_more": None, "next_after": None}
+            if has_more and not page:
+                raise WireError("wire server reported more messages but returned none")
+            if not has_more or len(messages) >= limit:
+                break
+            after = page[-1]["id"]
+        return {
+            "messages": messages,
+            "has_more": has_more,
+            "next_after": messages[-1]["id"] if has_more else None,
+        }
 
     # ── watch: streaming notification listener ────────────────────────────
 
@@ -153,14 +227,8 @@ class WireClient:
                         # that documented close as normal termination; any
                         # other close still raises below.
                         terminated = True
-        except FileNotFoundError as exc:
-            raise WireError(
-                f"wire server is not running at {self.store.socket_path}"
-            ) from exc
-        except (ConnectionRefusedError, socket.timeout) as exc:
-            raise WireError(
-                f"cannot reach wire server at {self.store.socket_path}: {exc}"
-            ) from exc
+        except TRANSPORT_ERRORS as exc:
+            raise self._transport_error(exc) from exc
         except WireError:
             if terminated:
                 return
